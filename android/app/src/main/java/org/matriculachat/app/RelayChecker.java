@@ -3,6 +3,7 @@ package org.matriculachat.app;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -35,12 +36,24 @@ public final class RelayChecker {
     public static final int CLAIM_POW = 16;
     private static final long MAX_FUTURE_SKEW = 5 * 60;
 
+    /** Reclamación de mi cubo hecha por otra clave; falta verificar si es de MI matrícula. */
+    public static final class ClaimCandidate {
+        public final String id, pubkey, salt, proof;
+        public final long createdAt;
+        public ClaimCandidate(String id, String pubkey, long createdAt, String salt, String proof) {
+            this.id = id; this.pubkey = pubkey; this.createdAt = createdAt; this.salt = salt; this.proof = proof;
+        }
+    }
+
+    public interface ClaimVerifier {
+        boolean belongsToMyPlate(ClaimCandidate c);
+    }
+
     public static final class Result {
         /** id → created_at de los mensajes nuevos dirigidos a mis claves. */
         public final Map<String, Long> messages = new ConcurrentHashMap<>();
-        /** id de la reclamación más reciente de mi matrícula hecha por OTRA clave, o null. */
-        public volatile String foreignClaimId = null;
-        public volatile long foreignClaimAt = 0;
+        /** Reclamaciones de mi cubo hechas por otras claves (pueden ser de otras matrículas). */
+        public final List<ClaimCandidate> foreignCandidates = new ArrayList<>();
         public final AtomicInteger relaysAnswered = new AtomicInteger();
     }
 
@@ -137,14 +150,50 @@ public final class RelayChecker {
             if (blocked.contains(ev.optString("pubkey"))) return;
             result.messages.put(id, createdAt);
         } else if (kind == KIND_CLAIM && plateTag != null && hasTag(tags, "x", Collections.singleton(plateTag))) {
-            if (myPub.equals(ev.optString("pubkey"))) return;
+            String pubkey = ev.optString("pubkey");
+            if (myPub.equals(pubkey)) return;
             if (leadingZeroBits(id) < CLAIM_POW) return; // sin prueba de trabajo: spam
-            synchronized (result) {
-                if (createdAt >= result.foreignClaimAt) {
-                    result.foreignClaimAt = createdAt;
-                    result.foreignClaimId = id;
+            try {
+                JSONObject c = new JSONObject(ev.optString("content"));
+                String s = c.optString("s"), p = c.optString("p");
+                if (c.optInt("v") != 2 || !s.matches("[0-9a-f]{32}") || !p.matches("[0-9a-f]{64}")) return;
+                if ("release".equals(c.optString("action"))) return;
+                synchronized (result.foreignCandidates) {
+                    for (ClaimCandidate x : result.foreignCandidates) if (x.id.equals(id)) return;
+                    result.foreignCandidates.add(new ClaimCandidate(id, pubkey, createdAt, s, p));
                 }
+            } catch (Exception ignored) {
+                // contenido malformado
             }
+        }
+    }
+
+    /**
+     * La reclamación AJENA más reciente que de verdad es de mi matrícula, o null.
+     * Verifica de la más nueva a la más antigua y como mucho `maxChecks` (scrypt es caro:
+     * así un relleno de reclamaciones falsas no agota la batería).
+     */
+    public static ClaimCandidate newestForeignClaim(List<ClaimCandidate> candidates, ClaimVerifier verifier, int maxChecks) {
+        List<ClaimCandidate> sorted = new ArrayList<>(candidates);
+        Collections.sort(sorted, (a, b) -> Long.compare(b.createdAt, a.createdAt));
+        int checks = 0;
+        for (ClaimCandidate c : sorted) {
+            if (checks++ >= maxChecks) break;
+            if (verifier.belongsToMyPlate(c)) return c;
+        }
+        return null;
+    }
+
+    /** Prueba v2: scrypt(matrícula, "matricula-chat/v2|proof|" + sal) == prueba. */
+    public static boolean verifyProof(String plate, ClaimCandidate c) {
+        try {
+            byte[] out = Scrypt.scrypt(plate.getBytes("UTF-8"), ("matricula-chat/v2|proof|" + c.salt).getBytes("UTF-8"),
+                    1 << 15, 8, 1, 32);
+            StringBuilder hex = new StringBuilder();
+            for (byte b : out) hex.append(String.format("%02x", b & 0xff));
+            return hex.toString().equals(c.proof);
+        } catch (Exception e) {
+            return false;
         }
     }
 

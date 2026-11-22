@@ -27,16 +27,18 @@ public class BackgroundCheckPlugin extends Plugin {
         Set<String> blocked = toSet(call.getArray("blocked"));
         String plateTag = call.getString("plateTag");
         String myPub = call.getString("myPub");
+        String plate = call.getString("plate");
 
         SharedPreferences.Editor ed = CheckWorker.prefs(getContext()).edit()
                 .putStringSet("pubkeys", pubkeys)
                 .putStringSet("relays", relays)
                 .putStringSet("blocked", blocked);
-        if (plateTag != null && myPub != null) {
-            ed.putString("plateTag", plateTag).putString("myPub", myPub);
+        if (plateTag != null && myPub != null && plate != null) {
+            ed.putString("plateTag", plateTag).putString("myPub", myPub).putString("plate", plate);
         } else {
-            ed.remove("plateTag").remove("myPub");
+            ed.remove("plateTag").remove("myPub").remove("plate");
         }
+        ed.remove("claimOk").remove("claimBad"); // otra matrícula o clave: se recalcula
         ed.apply();
 
         if (relays.isEmpty() || (pubkeys.isEmpty() && plateTag == null)) {

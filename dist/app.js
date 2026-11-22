@@ -1,12 +1,12 @@
 import {
   SimplePool, finalizeEvent, generateSecretKey, getPublicKey, nip44, minePow,
   scryptAsync, bytesToHex, hexToBytes, Capacitor, LocalNotifications, registerPlugin,
-  qrcode, Share, Filesystem, Directory,
+  qrcode, Share, Filesystem, Directory, sha256,
 } from './vendor.js';
 import {
   KIND_CLAIM, KIND_MSG, PARAMS, PLATE_KDF, PRESETS, presetText,
   normalizePlate, isValidPlate, isModernSpanishPlate, resolveClaims, validateMessage,
-  sendWait, inboundAllowed,
+  sendWait, inboundAllowed, bucketTag, proofInput, parseClaim, leadingZeroBits,
 } from './protocol.js';
 import { analyze, checkOutgoing } from './moderation.js';
 import { WEB_URL, quickLink, parseHash, stickerSvg } from './sticker.js';
@@ -57,13 +57,36 @@ function save() {
 
 // ---------- Criptografía ----------
 
-const tagCache = new Map();
-async function plateTag(plate) {
-  if (!tagCache.has(plate)) {
-    const { N, r, p, dkLen, salt } = PLATE_KDF;
-    tagCache.set(plate, bytesToHex(await scryptAsync(plate, salt, { N, r, p, dkLen })));
+const bucketOf = plate => bucketTag(sha256, plate);
+const randomHex = n => bytesToHex(crypto.getRandomValues(new Uint8Array(n)));
+
+// Prueba scrypt(matrícula, sal). En caché: varias reclamaciones del mismo
+// dispositivo comparten sal y solo se calcula una vez.
+const proofCache = new Map();
+function proofFor(plate, salt) {
+  const k = `${plate}|${salt}`;
+  if (!proofCache.has(k)) {
+    const { N, r, p, dkLen } = PLATE_KDF;
+    proofCache.set(k, scryptAsync(...proofInput(plate, salt), { N, r, p, dkLen }).then(bytesToHex));
   }
-  return tagCache.get(plate);
+  return proofCache.get(k);
+}
+
+// ¿Es esta reclamación de esta matrícula? Los filtros baratos van primero,
+// para no gastar scrypt en eventos que el protocolo ignoraría igualmente.
+const verdicts = new Map();
+async function claimBelongs(plate, ev) {
+  const k = `${plate}|${ev.id}`;
+  if (verdicts.has(k)) return verdicts.get(k);
+  const c = parseClaim(ev);
+  const ok = !!c
+    && ev.kind === KIND_CLAIM
+    && ev.tags.some(t => t[0] === 'x' && t[1] === bucketOf(plate))
+    && leadingZeroBits(ev.id) >= PARAMS.claimPow
+    && ev.created_at <= now() + PARAMS.maxFutureSkew
+    && (await proofFor(plate, c.s)) === c.p;
+  verdicts.set(k, ok);
+  return ok;
 }
 const pubOf = skHex => getPublicKey(hexToBytes(skHex));
 const convKey = (skHex, peer) => nip44.getConversationKey(hexToBytes(skHex), peer);
@@ -85,41 +108,48 @@ async function fetchClaims(tag) {
   return pool.querySync(relays, { kinds: [KIND_CLAIM], '#x': [tag] }, { maxWait: 4000 });
 }
 
+const latestOf = evs => evs.reduce((m, ev) => (ev.created_at <= now() + PARAMS.maxFutureSkew ? Math.max(m, ev.created_at) : m), 0);
+
 async function resolvePlate(plate) {
-  const tag = await plateTag(plate);
+  const tag = bucketOf(plate);
   const events = await fetchClaims(tag);
-  for (const ev of events) claimEvents.set(ev.id, ev); // resolveClaims filtra por matrícula
-  return { tag, ...resolveClaims(events, tag, now()) };
+  const mineEvs = [];
+  for (const ev of events) if (await claimBelongs(plate, ev)) mineEvs.push(ev); // en serie: scrypt usa 32 MB
+  return { tag, latest: latestOf(mineEvs), ...resolveClaims(mineEvs, () => true, now()) };
 }
 
-// Fecha más reciente de las reclamaciones conocidas de una matrícula (sin contar
-// las fechadas demasiado en el futuro, que el protocolo ignora).
-function latestClaimAt(tag) {
-  let max = 0;
-  for (const ev of claimEvents.values()) {
-    if (ev.tags.some(t => t[0] === 'x' && t[1] === tag) && ev.created_at <= now() + PARAMS.maxFutureSkew) {
-      max = Math.max(max, ev.created_at);
-    }
-  }
-  return max;
-}
+// Fecha más reciente de las reclamaciones conocidas de mi matrícula.
+const latestClaimAt = () => latestOf([...claimEvents.values()]);
 
 const tick = () => new Promise(r => setTimeout(r, 30));
 
-async function publishClaim(action, tag, skHex) {
+async function publishClaim(action, { plate, sk: skHex, salt, proof }, after = latestClaimAt()) {
   // Siempre posterior a la última reclamación conocida: si dos reclamaciones
   // cayeran en el mismo segundo, el desempate podría ordenarlas al revés.
   const unsigned = {
-    kind: KIND_CLAIM, created_at: Math.max(now(), latestClaimAt(tag) + 1), pubkey: pubOf(skHex),
-    tags: [['x', tag]], content: JSON.stringify({ action }),
+    kind: KIND_CLAIM, created_at: Math.max(now(), after + 1), pubkey: pubOf(skHex),
+    tags: [['x', bucketOf(plate)]], content: JSON.stringify({ v: 2, action, s: salt, p: proof }),
   };
   await tick(); // deja que se pinte el "trabajando…"
   // keepCreatedAt: si no, minePow sustituye la fecha por "ahora" y se pierde el ajuste de arriba.
   const mined = minePow(unsigned, PARAMS.claimPow, { keepCreatedAt: true });
   const ev = finalizeEvent(mined, hexToBytes(skHex));
   await publish(ev);
-  claimEvents.set(ev.id, ev);
+  verdicts.set(`${plate}|${ev.id}`, true);
+  if (store.plate?.plate === plate) claimEvents.set(ev.id, ev);
   return ev;
+}
+
+// Avisos a una matrícula sin titular (o en disputa): se comportan igual que
+// los de una matrícula cuyo dueño no contesta, para que la app no sirva para
+// averiguar qué matrículas están registradas.
+async function sendPhantom(thread, payload) {
+  assertCanSend();
+  await new Promise(r => setTimeout(r, 300 + Math.random() * 500)); // como un envío real
+  const at = now();
+  thread.messages.push({ id: randomHex(32), from: 'me', ...payload, at });
+  thread.updated = at;
+  save();
 }
 
 // Máximo 5 mensajes por minuto desde este dispositivo, sumando todas las conversaciones.
@@ -152,7 +182,7 @@ let pendingMsgs = [];
 
 function recomputeMine() {
   if (!store.plate) { mine = { status: 'none' }; return; }
-  const r = resolveClaims([...claimEvents.values()], store.plate.tag, now());
+  const r = resolveClaims([...claimEvents.values()], () => true, now());
   const myPub = pubOf(store.plate.sk);
   const prev = mine.status;
   if (r.status === 'held' && r.holder === myPub) mine = { ...r, status: 'active' };
@@ -168,8 +198,21 @@ function recomputeMine() {
     'Has dejado de recibir mensajes en este dispositivo.');
   }
   if (mine.status === 'active' && now() - mine.lastSeen > PARAMS.claimRefresh) {
-    publishClaim('claim', store.plate.tag, store.plate.sk).then(recomputeMine).catch(() => {});
+    publishClaim('claim', store.plate).then(recomputeMine).catch(() => {});
   }
+}
+
+// Matrículas registradas con el formato anterior: se les genera sal y prueba
+// y, al terminar de cargar, se vuelven a reclamar con la misma clave.
+async function upgradePlate() {
+  const p = store.plate;
+  if (!p || (p.v === 2 && p.salt && p.proof)) return;
+  p.salt = randomHex(16);
+  p.proof = await proofFor(p.plate, p.salt);
+  p.tag = bucketOf(p.plate);
+  p.v = 2;
+  p.migrate = true;
+  save();
 }
 
 function watchMyPlate() {
@@ -177,18 +220,31 @@ function watchMyPlate() {
   claimEvents = new Map();
   claimsReady = false;
   if (!store.plate) { recomputeMine(); render(); return; }
-  claimSub = pool.subscribe(relays, { kinds: [KIND_CLAIM], '#x': [store.plate.tag] }, {
+  const mineObj = store.plate;
+  // Los eventos del cubo se verifican en serie (scrypt), en orden de llegada.
+  let queue = Promise.resolve();
+  const later = fn => { queue = queue.then(fn).catch(() => {}); };
+  claimSub = pool.subscribe(relays, { kinds: [KIND_CLAIM], '#x': [bucketOf(mineObj.plate)] }, {
     onevent(ev) {
-      claimEvents.set(ev.id, ev);
-      if (claimsReady) { recomputeMine(); render(); }
+      later(async () => {
+        if (store.plate !== mineObj || !(await claimBelongs(mineObj.plate, ev))) return;
+        claimEvents.set(ev.id, ev);
+        if (claimsReady) { recomputeMine(); render(); }
+      });
     },
     oneose() {
-      if (claimsReady) return;
-      claimsReady = true;
-      recomputeMine();
-      const queued = pendingMsgs; pendingMsgs = [];
-      queued.forEach(handleMsg);
-      render();
+      later(async () => {
+        if (claimsReady || store.plate !== mineObj) return;
+        if (mineObj.migrate) {
+          delete mineObj.migrate; save();
+          try { await publishClaim('claim', mineObj); } catch {}
+        }
+        claimsReady = true;
+        recomputeMine();
+        const queued = pendingMsgs; pendingMsgs = [];
+        queued.forEach(handleMsg);
+        render();
+      });
     },
   });
 }
@@ -201,22 +257,24 @@ async function claimPlate(input) {
   if (r.status === 'disputed') {
     throw new Error(`Esta matrícula está en disputa hasta ${fmtDate(r.frozenUntil)}. Inténtalo después.`);
   }
-  // Misma matrícula en este dispositivo: reutiliza la clave. Otra: clave nueva.
-  const sk = store.plate?.plate === plate ? store.plate.sk : bytesToHex(generateSecretKey());
+  // Misma matrícula en este dispositivo: reutiliza clave y sal. Otra: nuevas.
+  const same = store.plate?.plate === plate && store.plate.salt;
+  const sk = same ? store.plate.sk : bytesToHex(generateSecretKey());
+  const salt = same ? store.plate.salt : randomHex(16);
   if (store.plate && store.plate.plate !== plate) await releasePlate(false);
   setBusy('Generando prueba de trabajo…');
-  store.plate = { plate, tag: r.tag, sk };
+  const proof = await proofFor(plate, salt);
+  store.plate = { plate, tag: r.tag, sk, salt, proof, v: 2 };
   save();
-  await publishClaim('claim', r.tag, sk);
+  await publishClaim('claim', store.plate, r.latest);
   watchMyPlate();
 }
 
 async function releasePlate(rerender = true) {
   if (!store.plate) return;
-  const { tag, sk } = store.plate;
   if (mine.status === 'active') {
     setBusy('Liberando…');
-    try { await publishClaim('release', tag, sk); } catch {}
+    try { await publishClaim('release', store.plate); } catch {}
   }
   closeThreads(t => t.role === 'holder', 'released');
   store.plate = null;
@@ -315,21 +373,21 @@ async function startConversation(input, presetId) {
   if (!isValidPlate(plate)) throw new Error('Matrícula no válida.');
   assertCanSend();
   setBusy('Buscando matrícula…');
+  if (store.plate?.plate === plate) throw new Error('Es tu propia matrícula.');
   const r = await resolvePlate(plate);
-  if (r.status === 'disputed') throw new Error('Esa matrícula está en disputa y no recibe mensajes ahora mismo.');
-  if (r.status !== 'held') throw new Error('Esa matrícula no está recibiendo mensajes.');
   if (store.plate && r.holder === pubOf(store.plate.sk)) throw new Error('Es tu propia matrícula.');
   // Una clave efímera nueva por conversación: el remitente es anónimo y
   // sus conversaciones no se pueden relacionar entre sí.
   const sk = bytesToHex(generateSecretKey());
   const id = 'out:' + pubOf(sk);
   const t = store.threads[id] = {
-    id, role: 'sender', plate, tag: r.tag, sk, myPub: pubOf(sk), peer: r.holder,
+    id, role: 'sender', plate, tag: r.tag, sk, myPub: pubOf(sk), peer: r.status === 'held' ? r.holder : null,
     messages: [], created: now(),
   };
   setBusy('Enviando…');
   try {
-    await sendRaw(t, { type: 'preset', preset: presetId });
+    if (t.peer) await sendRaw(t, { type: 'preset', preset: presetId });
+    else await sendPhantom(t, { type: 'preset', preset: presetId });
   } catch (e) {
     delete store.threads[id]; save(); throw e;
   }
@@ -354,11 +412,15 @@ async function sendInThread(id, payload) {
     // dispositivo. Si ha cambiado, la conversación se cierra: el nuevo
     // titular no puede continuar una conversación ajena.
     const r = await resolvePlate(t.plate);
-    if (r.status !== 'held' || r.holder !== t.peer) {
+    if (!t.peer) {
+      // Conversación con una matrícula sin titular: si ahora lo tiene, se le empieza a entregar.
+      if (r.status === 'held' && r.holder !== (store.plate && pubOf(store.plate.sk))) { t.peer = r.holder; save(); }
+    } else if (r.status !== 'held' || r.holder !== t.peer) {
       t.closed = r.status === 'disputed' ? 'disputed' : 'changed';
       save();
       throw new Error(closedReason(t.closed));
     }
+    if (!t.peer) { await sendPhantom(t, payload); return; }
   } else if (mine.status !== 'active' || store.plate?.sk !== t.sk) {
     t.closed = 'kicked'; save();
     throw new Error(closedReason('kicked'));
@@ -421,7 +483,8 @@ function syncBackground() {
     pubkeys: [...new Set(pubkeys)].sort(),
     relays,
     blocked: [...store.blocked].sort(),
-    plateTag: active ? store.plate.tag : null,
+    plateTag: active ? bucketOf(store.plate.plate) : null,
+    plate: active ? store.plate.plate : null,
     myPub: active ? pubOf(store.plate.sk) : null,
   };
   const sig = JSON.stringify(cfg);
@@ -904,8 +967,8 @@ app.addEventListener('change', e => {
 // ---------- Arranque ----------
 
 applyHash();
-watchMyPlate();
 render();
+upgradePlate().catch(() => {}).finally(watchMyPlate);
 checkNotifPerm().then(render);
 setInterval(() => { if (claimsReady) { recomputeMine(); render(); } markSeen(); }, 60_000);
 markSeen();

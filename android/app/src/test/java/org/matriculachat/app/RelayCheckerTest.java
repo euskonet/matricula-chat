@@ -41,7 +41,15 @@ public class RelayCheckerTest {
 
         assertEquals(1, r.relaysAnswered.get());
         assertEquals(new HashSet<>(toList(f.getJSONArray("expectedMessageIds"))), r.messages.keySet());
-        assertEquals(f.getString("expectedForeignClaim"), r.foreignClaimId);
+        // En el cubo hay 2 reclamaciones ajenas: la de mi matrícula y otra más reciente de
+        // una matrícula vecina. Solo la primera supera la verificación scrypt.
+        assertEquals(2, r.foreignCandidates.size());
+        String plate = f.getString("plate");
+        RelayChecker.ClaimCandidate c = RelayChecker.newestForeignClaim(r.foreignCandidates,
+                x -> RelayChecker.verifyProof(plate, x), 5);
+        assertEquals(f.getString("expectedForeignClaim"), c.id);
+        assertEquals(null, RelayChecker.newestForeignClaim(r.foreignCandidates,
+                x -> RelayChecker.verifyProof("9999ZZZ", x), 5));
     }
 
     @Test

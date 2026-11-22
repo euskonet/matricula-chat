@@ -13,7 +13,8 @@ const claim = (pubkey, t, action = 'claim', tag = TAG) => ({
   created_at: t, tags: [['x', tag]], content: JSON.stringify({ action }),
 });
 const H = 3600;
-const resolve = (evs, now) => resolveClaims(evs, TAG, now, P);
+const belongs = ev => ev.tags.some(t => t[0] === 'x' && t[1] === TAG);
+const resolve = (evs, now) => resolveClaims(evs, belongs, now, P);
 
 test('normaliza y valida matrículas', () => {
   assert.equal(normalizePlate(' 1234-bcd '), '1234BCD');
@@ -109,9 +110,9 @@ test('una reclamación caducada no cuenta como cambio al reclamarla otro', () =>
 
 test('se exige prueba de trabajo', () => {
   const evs = [claim('A', 0)];
-  assert.equal(resolveClaims(evs, TAG, H, { ...PARAMS, claimPow: 16 }).status, 'held'); // id = 000...0
+  assert.equal(resolveClaims(evs, belongs, H, { ...PARAMS, claimPow: 16 }).status, 'held'); // id = 000...0
   const bad = { ...claim('B', 10), id: 'f'.repeat(64) };
-  assert.equal(resolveClaims([...evs, bad], TAG, H, { ...PARAMS, claimPow: 16 }).holder, 'A');
+  assert.equal(resolveClaims([...evs, bad], belongs, H, { ...PARAMS, claimPow: 16 }).holder, 'A');
 });
 
 test('validateMessage: presets siempre, texto solo si se permite', () => {
@@ -155,3 +156,35 @@ test('inboundAllowed: conversaciones nuevas por matrícula', () => {
   assert.ok(!inboundAllowed({ times: [], t: 1200, replied: false, newThread: true, threadStarts: starts }));
   assert.ok(inboundAllowed({ times: [], t: 5000, replied: false, newThread: true, threadStarts: starts }));
 });
+
+import { sha256 } from '@noble/hashes/sha2.js';
+import { scrypt } from '@noble/hashes/scrypt.js';
+import { bucketTag, proofInput, parseClaim, PLATE_KDF, BUCKET_BITS } from '../src/protocol.js';
+
+test('bucketTag: determinista, 12 bits, distinto por matrícula', () => {
+  const a = bucketTag(sha256, '1234BCD');
+  assert.equal(a, bucketTag(sha256, '1234BCD'));
+  assert.match(a, /^mc2-[0-9a-f]{3}$/);
+  assert.equal(BUCKET_BITS, 12);
+  const tags = new Set(Array.from({ length: 300 }, (_, i) => bucketTag(sha256, `${1000 + i}BCD`)));
+  assert.ok(tags.size > 250, `pocas colisiones esperadas, hay ${tags.size} cubos distintos`);
+});
+
+test('prueba scrypt: solo coincide con la matrícula y la sal correctas', () => {
+  const { N, r, p, dkLen } = PLATE_KDF;
+  const salt = 'ab'.repeat(16);
+  const proof = hex(scrypt(...proofInput('1234BCD', salt), { N, r, p, dkLen }));
+  assert.equal(proof, hex(scrypt(...proofInput('1234BCD', salt), { N, r, p, dkLen })));
+  assert.notEqual(proof, hex(scrypt(...proofInput('1234BCF', salt), { N, r, p, dkLen })));
+  assert.notEqual(proof, hex(scrypt(...proofInput('1234BCD', 'cd'.repeat(16)), { N, r, p, dkLen })));
+});
+
+test('parseClaim', () => {
+  const ok = { content: JSON.stringify({ v: 2, action: 'claim', s: 'a'.repeat(32), p: 'b'.repeat(64) }) };
+  assert.deepEqual(parseClaim(ok), { action: 'claim', s: 'a'.repeat(32), p: 'b'.repeat(64) });
+  assert.equal(parseClaim({ content: '{"action":"claim"}' }), null);          // formato v1
+  assert.equal(parseClaim({ content: JSON.stringify({ v: 2, s: 'zz', p: 'b'.repeat(64) }) }), null);
+  assert.equal(parseClaim({ content: 'no json' }), null);
+});
+
+function hex(b) { return Array.from(b, x => x.toString(16).padStart(2, '0')).join(''); }

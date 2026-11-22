@@ -95,12 +95,17 @@ await A.waitForSelector('.banner.warn', { timeout: 10000 });
 step('al tercer cambio en 24 h la matrícula queda en disputa en todos los dispositivos');
 await shot(A, '6-A-disputa');
 
-// 8. Nadie puede escribir a una matrícula en disputa
+// 8. Escribir a una matrícula en disputa parece un envío normal, pero no le llega a nadie
 await B.click('[data-action=back]');
+const before = { A: await A.$$eval('.thread', t => t.length), C: await C.$$eval('.thread', t => t.length) };
 await B.fill('form[data-action=compose] input', PLATE);
 await B.click('.presets button[value=tyre]');
-await B.waitForSelector('.toast.error');
-step('B no puede escribir a una matrícula en disputa: ' + await B.textContent('.toast.error'));
+await B.waitForSelector('.messages .msg.me');
+assert.equal(await B.$('.toast.error'), null);
+await A.waitForTimeout(1500);
+assert.equal(await A.$$eval('.thread', t => t.length), before.A);
+assert.equal(await C.$$eval('.thread', t => t.length), before.C);
+step('avisar a una matrícula en disputa parece normal, pero nadie lo recibe');
 
 assert.deepEqual(errors, []);
 await browser.close();

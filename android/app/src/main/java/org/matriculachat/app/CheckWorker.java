@@ -84,6 +84,7 @@ public class CheckWorker extends Worker {
         List<String> relays = new ArrayList<>(p.getStringSet("relays", new HashSet<>()));
         String plateTag = p.getString("plateTag", null);
         String myPub = p.getString("myPub", null);
+        String plate = p.getString("plate", null);
         long seenAt = p.getLong("seenAt", System.currentTimeMillis() / 1000);
         if (relays.isEmpty() || (pubkeys.isEmpty() && plateTag == null)) return Result.success();
 
@@ -114,9 +115,20 @@ public class CheckWorker extends Worker {
             notified.addAll(r.messages.keySet());
         }
 
-        // ¿Ha reclamado alguien mi matrícula?
+        // ¿Ha reclamado alguien mi matrícula? En el cubo hay también otras
+        // matrículas: solo cuenta si la prueba scrypt coincide con la mía.
         String lastClaimNotified = p.getString("claimNotified", "");
-        boolean claimAlert = r.foreignClaimId != null && !r.foreignClaimId.equals(lastClaimNotified);
+        Set<String> verdictsOk = new HashSet<>(p.getStringSet("claimOk", new HashSet<>()));
+        Set<String> verdictsBad = new HashSet<>(p.getStringSet("claimBad", new HashSet<>()));
+        RelayChecker.ClaimCandidate foreign = plate == null ? null : RelayChecker.newestForeignClaim(r.foreignCandidates, c -> {
+            String key = c.pubkey + ":" + c.salt;
+            if (verdictsOk.contains(key)) return true;
+            if (verdictsBad.contains(key)) return false;
+            boolean ok = RelayChecker.verifyProof(plate, c);
+            (ok ? verdictsOk : verdictsBad).add(key);
+            return ok;
+        }, 5);
+        boolean claimAlert = foreign != null && !foreign.id.equals(lastClaimNotified);
         if (claimAlert) {
             notify(ctx, NOTIF_CLAIM, "Otro dispositivo ha reclamado tu matrícula",
                     "Abre la app para comprobarlo y recuperarla si no has sido tú.");
@@ -128,7 +140,9 @@ public class CheckWorker extends Worker {
         SharedPreferences.Editor ed = p.edit()
                 .putString("notified", android.text.TextUtils.join(",", keep))
                 .putInt("pendingCount", pending);
-        if (claimAlert) ed.putString("claimNotified", r.foreignClaimId);
+        if (claimAlert) ed.putString("claimNotified", foreign.id);
+        if (verdictsBad.size() > MAX_REMEMBERED) verdictsBad.clear();
+        ed.putStringSet("claimOk", verdictsOk).putStringSet("claimBad", verdictsBad);
         ed.apply();
         return Result.success();
     }

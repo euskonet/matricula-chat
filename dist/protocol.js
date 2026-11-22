@@ -3,7 +3,7 @@
 // todos los clientes aplican las mismas reglas sobre el mismo historial
 // público de eventos y llegan al mismo estado, sin servidor que arbitre.
 
-export const PROTOCOL = 'matricula-chat/v1';
+export const PROTOCOL = 'matricula-chat/v2';
 
 // Kinds "regulares" (1000-9999): los relays los guardan y no los reemplazan,
 // así el historial de reclamaciones no se puede reescribir sustituyendo eventos.
@@ -22,10 +22,41 @@ export const PARAMS = {
   maxText: 500,
 };
 
-// Parámetros scrypt para convertir la matrícula en una etiqueta pública.
-// El espacio de matrículas es pequeño (~80 M), así que un hash rápido se
-// recorrería entero en segundos; scrypt lo encarece mucho, aunque no lo impide.
-export const PLATE_KDF = { N: 2 ** 15, r: 8, p: 1, dkLen: 32, salt: PROTOCOL };
+// ---------- Identificación de la matrícula (v2) ----------
+// El espacio de matrículas es pequeño (~80 M), así que no se puede publicar
+// un hash de la matrícula sin más: se recorrería entero. En su lugar:
+//  - Cubo: la reclamación solo lleva BUCKET_BITS bits de un SHA-256 de la
+//    matrícula (4096 cubos, ~20.000 matrículas posibles en cada uno).
+//  - Prueba: scrypt(matrícula, sal aleatoria de la reclamación). Para saber
+//    qué matrícula hay detrás de UNA reclamación hay que probar las ~20.000
+//    del cubo con scrypt (~20 min de cálculo); sacar la lista entera, años.
+// Quien conoce la matrícula solo verifica las pocas reclamaciones de su cubo.
+export const BUCKET_BITS = 12;
+export const PLATE_KDF = { N: 2 ** 15, r: 8, p: 1, dkLen: 32 };
+const enc = new TextEncoder();
+const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+
+/** Etiqueta pública del cubo de una matrícula. `sha256` se inyecta (Uint8Array → Uint8Array). */
+export function bucketTag(sha256, plate) {
+  const h = hex(sha256(enc.encode(`${PROTOCOL}|bucket|${plate}`)));
+  return 'mc2-' + h.slice(0, BUCKET_BITS / 4);
+}
+
+/** Entrada de scrypt para la prueba: [contraseña, sal]. */
+export function proofInput(plate, saltHex) {
+  return [enc.encode(plate), enc.encode(`${PROTOCOL}|proof|${saltHex}`)];
+}
+
+/** Lee {action, s, p} de una reclamación v2, o null si no lo es. */
+export function parseClaim(ev) {
+  try {
+    const c = JSON.parse(ev.content);
+    if (c?.v !== 2 || !/^[0-9a-f]{32}$/.test(c.s) || !/^[0-9a-f]{64}$/.test(c.p)) return null;
+    return { action: c.action === 'release' ? 'release' : 'claim', s: c.s, p: c.p };
+  } catch {
+    return null;
+  }
+}
 
 export const PRESETS = [
   { id: 'lights', es: 'Te has dejado las luces encendidas' },
@@ -78,9 +109,10 @@ function claimAction(ev) {
   }
 }
 
-export function isValidClaimEvent(ev, plateTag, now, params = PARAMS) {
+/** @param belongs (ev) => boolean: la reclamación es de esta matrícula (prueba ya verificada). */
+export function isValidClaimEvent(ev, belongs, now, params = PARAMS) {
   return ev.kind === KIND_CLAIM
-    && tagValue(ev, 'x') === plateTag
+    && belongs(ev)
     && ev.created_at <= now + params.maxFutureSkew
     && leadingZeroBits(ev.id) >= params.claimPow;
 }
@@ -100,9 +132,9 @@ export function isValidClaimEvent(ev, plateTag, now, params = PARAMS) {
  * @returns {{status:'free'|'held'|'disputed', holder:string|null, since:number|null,
  *            lastSeen:number|null, frozenUntil:number|null, changes:number}}
  */
-export function resolveClaims(events, plateTag, now, params = PARAMS) {
+export function resolveClaims(events, belongs, now, params = PARAMS) {
   const valid = events
-    .filter(ev => isValidClaimEvent(ev, plateTag, now, params))
+    .filter(ev => isValidClaimEvent(ev, belongs, now, params))
     .sort((a, b) => a.created_at - b.created_at || (a.id < b.id ? -1 : 1));
 
   let holder = null, since = null, lastSeen = null;

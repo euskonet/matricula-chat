@@ -10,3 +10,4 @@ export { registerPlugin } from '@capacitor/core';
 export { default as qrcode } from 'qrcode-generator';
 export { Share } from '@capacitor/share';
 export { Filesystem, Directory } from '@capacitor/filesystem';
+export { sha256 } from '@noble/hashes/sha2.js';
