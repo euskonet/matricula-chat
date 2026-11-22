@@ -8,7 +8,7 @@ await build({
   bundle: true, format: 'esm', minify: true, target: 'es2022',
   outfile: 'dist/vendor.js', legalComments: 'eof',
 });
-for (const f of ['index.html', 'app.js', 'protocol.js', 'style.css', 'manifest.webmanifest', 'icon.svg']) {
+for (const f of ['index.html', 'app.js', 'protocol.js', 'sticker.js', 'style.css', 'manifest.webmanifest', 'icon.svg']) {
   await cp(`src/${f}`, `dist/${f}`);
 }
 console.log('dist/ listo');

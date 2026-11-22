@@ -7,3 +7,6 @@ export { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 export { Capacitor } from '@capacitor/core';
 export { LocalNotifications } from '@capacitor/local-notifications';
 export { registerPlugin } from '@capacitor/core';
+export { default as qrcode } from 'qrcode-generator';
+export { Share } from '@capacitor/share';
+export { Filesystem, Directory } from '@capacitor/filesystem';

@@ -1,11 +1,13 @@
 import {
   SimplePool, finalizeEvent, generateSecretKey, getPublicKey, nip44, minePow,
   scryptAsync, bytesToHex, hexToBytes, Capacitor, LocalNotifications, registerPlugin,
+  qrcode, Share, Filesystem, Directory,
 } from './vendor.js';
 import {
   KIND_CLAIM, KIND_MSG, PARAMS, PLATE_KDF, PRESETS, presetText,
   normalizePlate, isValidPlate, isModernSpanishPlate, resolveClaims, validateMessage,
 } from './protocol.js';
+import { WEB_URL, quickLink, parseHash, stickerSvg } from './sticker.js';
 
 // ---------- Configuración ----------
 
@@ -444,7 +446,8 @@ function renderMyPlate() {
   const p = store.plate.plate;
   let status;
   if (!claimsReady) status = `<p class="status">Comprobando estado…</p>`;
-  else if (mine.status === 'active') status = `<p class="status ok">● Recibiendo mensajes desde ${fmtDate(mine.since)}</p>`;
+  else if (mine.status === 'active') status = `<p class="status ok">● Recibiendo mensajes desde ${fmtDate(mine.since)}</p>
+      <button class="secondary wide" data-action="sticker">Crear pegatina QR para el coche</button>`;
   else if (mine.status === 'disputed') status = `
       <div class="banner warn"><strong>Matrícula en disputa</strong>
       Ha cambiado de dispositivo demasiadas veces en 24 h. Nadie recibe mensajes hasta ${fmtDate(mine.frozenUntil)}.</div>`;
@@ -526,6 +529,137 @@ function renderThread(t) {
     </footer>`}`;
 }
 
+// ---------- Aviso rápido (al escanear una pegatina) ----------
+
+function renderQuick(plate) {
+  return `
+    <header class="thread-head"><button class="link" data-action="back">‹ Inicio</button></header>
+    <section class="card quick">
+      <p class="muted center">Vas a avisar al conductor de</p>
+      <div class="center">${plateBadge(plate, 'big')}</div>
+      <div class="presets">
+        ${PRESETS.filter(x => !['thanks', 'onmyway'].includes(x.id)).map(x => `<button data-quick="${x.id}">${esc(x.es)}</button>`).join('')}
+      </div>
+      <p class="muted small center quick-foot">Sin registro. El conductor no sabrá quién eres. Si te contesta, podréis escribiros.</p>
+    </section>`;
+}
+
+// ---------- Pegatinas QR ----------
+
+const stickerOpts = { size: 70, copies: 6, showPlate: true };
+// En la app nativa el QR apunta a la web pública; en la web, a donde se esté sirviendo.
+const stickerUrl = plate => quickLink(isNative ? WEB_URL : location.href, plate);
+const currentSticker = (plate, widthMm = stickerOpts.size) =>
+  stickerSvg({ qrcode, url: stickerUrl(plate), plate, showPlate: stickerOpts.showPlate, widthMm });
+
+function renderSticker(plate) {
+  const opt = (v, cur, label = v) => `<option value="${v}" ${String(v) === String(cur) ? 'selected' : ''}>${label}</option>`;
+  const preview = currentSticker(plate).replace(/width="[^"]+" height="[^"]+"/, 'class="sticker-svg" role="img" aria-label="Vista previa de la pegatina"');
+  return `
+    <header class="thread-head"><button class="link" data-action="back">‹ Volver</button><div><strong>Pegatina QR</strong></div></header>
+    <section class="sticker-preview">${preview}</section>
+    <section class="card">
+      <form data-action="sticker-opts" class="opts">
+        <label>Tamaño <select name="size">${opt(50, stickerOpts.size, '5 cm')}${opt(70, stickerOpts.size, '7 cm')}${opt(90, stickerOpts.size, '9 cm')}</select></label>
+        ${isNative ? '' : `<label>Copias <select name="copies">${[1, 2, 4, 6, 9, 12].map(n => opt(n, stickerOpts.copies)).join('')}</select></label>`}
+        <label class="check"><input type="checkbox" name="showPlate" ${stickerOpts.showPlate ? 'checked' : ''}> Mostrar la matrícula</label>
+      </form>
+      <div class="actions">
+        ${isNative
+          ? `<button data-action="sticker-share">Compartir imagen</button>
+             <a class="btn secondary" href="${esc(WEB_URL)}#pegatina=${esc(plate)}" target="_blank" rel="noopener">Imprimir desde la web</a>`
+          : `<button data-action="sticker-print">Imprimir</button>
+             <button class="secondary" data-action="sticker-png">Descargar PNG</button>`}
+        <button class="secondary" data-action="sticker-link">Compartir enlace</button>
+      </div>
+      <p class="muted small">Pégala en el cristal mirando hacia fuera. Quien la escanee podrá avisarte desde el navegador, sin instalar nada. El enlace solo contiene tu matrícula, que de todas formas se ve en el coche.</p>
+    </section>`;
+}
+
+function printStickers(plate) {
+  let sheet = document.getElementById('print-sheet');
+  if (!sheet) {
+    sheet = document.createElement('div');
+    sheet.id = 'print-sheet';
+    document.body.appendChild(sheet);
+  }
+  sheet.innerHTML = Array.from({ length: stickerOpts.copies }, () => currentSticker(plate)).join('');
+  window.print();
+}
+
+async function stickerPng(plate) {
+  const px = Math.round(stickerOpts.size / 25.4 * 300);  // 300 ppp
+  const h = Math.round(px * 1.3);
+  const svg = currentSticker(plate).replace(/width="[^"]+" height="[^"]+"/, `width="${px}" height="${h}"`);
+  const img = new Image();
+  img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+  await img.decode();
+  const canvas = Object.assign(document.createElement('canvas'), { width: px, height: h });
+  canvas.getContext('2d').drawImage(img, 0, 0, px, h);
+  return new Promise((res, rej) => canvas.toBlob(b => (b ? res(b) : rej(new Error('No se pudo generar la imagen.'))), 'image/png'));
+}
+
+const blobToBase64 = blob => new Promise((res, rej) => {
+  const r = new FileReader();
+  r.onload = () => res(String(r.result).split(',')[1]);
+  r.onerror = rej;
+  r.readAsDataURL(blob);
+});
+
+const isCancel = e => /cancel/i.test(e?.message || '') || e?.name === 'AbortError';
+
+async function shareStickerImage(plate) {
+  setBusy('Generando imagen…');
+  const blob = await stickerPng(plate);
+  const file = await Filesystem.writeFile({
+    path: `pegatina-${plate}.png`, data: await blobToBase64(blob), directory: Directory.Cache,
+  });
+  busy = ''; render();
+  try { await Share.share({ title: 'Pegatina Matrícula Chat', files: [file.uri] }); } catch (e) { if (!isCancel(e)) throw e; }
+}
+
+async function downloadStickerPng(plate) {
+  setBusy('Generando imagen…');
+  const blob = await stickerPng(plate);
+  const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `pegatina-${plate}.png` });
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+}
+
+async function shareStickerLink(plate) {
+  const url = stickerUrl(plate);
+  const title = 'Avísame por Matrícula Chat';
+  try {
+    if (isNative) return void await Share.share({ title, url });
+    if (navigator.share) return void await navigator.share({ title, url });
+  } catch (e) { if (isCancel(e)) return; }
+  await navigator.clipboard.writeText(url);
+  flash('Enlace copiado');
+}
+
+let notice = '';
+function flash(msg) {
+  notice = msg; render();
+  setTimeout(() => { if (notice === msg) { notice = ''; render(); } }, 2500);
+}
+
+// ---------- Rutas por fragmento (#avisar=…, #pegatina=…) ----------
+
+function applyHash() {
+  const h = parseHash(location.hash);
+  if (!h) return false;
+  view = (h.action === 'avisar' ? 'quick:' : 'sticker:') + h.plate;
+  error = '';
+  return true;
+}
+window.addEventListener('hashchange', () => { if (applyHash()) render(); });
+
+function goHome() {
+  view = 'home'; error = '';
+  if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+  render();
+}
+
 function render() {
   const t = view.startsWith('thread:') ? store.threads[view.slice(7)] : null;
   if (t && t.unread) { t.unread = 0; save(); }
@@ -533,8 +667,10 @@ function render() {
   const keep = {};
   app.querySelectorAll('input').forEach(i => { if (i.name) keep[i.closest('form')?.dataset.action + i.name] = i.value; });
 
+  const quickPlate = view.startsWith('quick:') ? view.slice(6) : null;
+  const stickerPlate = view.startsWith('sticker:') ? view.slice(8) : null;
   app.innerHTML = `
-    ${t ? renderThread(t) : `
+    ${t ? renderThread(t) : quickPlate ? renderQuick(quickPlate) : stickerPlate ? renderSticker(stickerPlate) : `
       <header class="top">
         <h1>Matrícula Chat</h1>
         <p class="muted small">Sin servidor · cifrado de extremo a extremo · ${relays.length} ${relays.length === 1 ? 'relay público' : 'relays públicos'}</p>
@@ -547,7 +683,8 @@ function render() {
         <button class="link" data-action="about">Cómo funciona</button>
       </footer>`}
     ${busy ? `<div class="toast">${esc(busy)}</div>` : ''}
-    ${error ? `<div class="toast error" data-action="dismiss">${esc(error)}</div>` : ''}`;
+    ${error ? `<div class="toast error" data-action="dismiss">${esc(error)}</div>` : ''}
+    ${notice && !busy && !error ? `<div class="toast">${esc(notice)}</div>` : ''}`;
 
   app.querySelectorAll('input').forEach(i => {
     const k = i.closest('form')?.dataset.action + i.name;
@@ -582,12 +719,26 @@ app.addEventListener('submit', e => {
 });
 
 app.addEventListener('click', e => {
-  const el = e.target.closest('[data-action],[data-open],[data-preset]');
+  const el = e.target.closest('[data-action],[data-open],[data-preset],[data-quick]');
   if (!el) return;
   if (el.dataset.open) { view = 'thread:' + el.dataset.open; error = ''; render(); return; }
+  if (el.dataset.quick) {
+    const plate = view.slice(6), preset = el.dataset.quick;
+    run(async () => {
+      const id = await startConversation(plate, preset);
+      if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+      view = 'thread:' + id;
+    });
+    return;
+  }
   if (el.dataset.preset) { run(() => sendInThread(view.slice(7), { type: 'preset', preset: el.dataset.preset })); return; }
   switch (el.dataset.action) {
-    case 'back': view = 'home'; error = ''; render(); break;
+    case 'back': goHome(); break;
+    case 'sticker': view = 'sticker:' + store.plate.plate; error = ''; render(); window.scrollTo(0, 0); break;
+    case 'sticker-print': printStickers(view.slice(8)); break;
+    case 'sticker-png': run(() => downloadStickerPng(view.slice(8))); break;
+    case 'sticker-share': run(() => shareStickerImage(view.slice(8))); break;
+    case 'sticker-link': run(() => shareStickerLink(view.slice(8))); break;
     case 'dismiss': error = ''; render(); break;
     case 'reclaim': run(() => claimPlate(store.plate.plate)); break;
     case 'release':
@@ -598,8 +749,18 @@ app.addEventListener('click', e => {
   }
 });
 
+app.addEventListener('change', e => {
+  const form = e.target.closest('form[data-action=sticker-opts]');
+  if (!form) return;
+  stickerOpts.size = Number(form.size.value);
+  if (form.copies) stickerOpts.copies = Number(form.copies.value);
+  stickerOpts.showPlate = form.showPlate.checked;
+  render();
+});
+
 // ---------- Arranque ----------
 
+applyHash();
 watchMyPlate();
 render();
 checkNotifPerm().then(render);

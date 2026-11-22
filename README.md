@@ -19,6 +19,20 @@ La app es un conjunto de archivos estáticos (`dist/`). Los mensajes viajan por 
 | Conversaciones atadas a la clave | Si cambia el titular, las conversaciones abiertas se cierran. El nuevo dispositivo no puede leer nada anterior ni continuar conversaciones ajenas. |
 | Anti acoso | Un desconocido solo puede enviar **avisos predefinidos** hasta que el titular conteste. Lo aplica el cliente del receptor, así que modificar la app del remitente no sirve de nada. |
 
+## Pegatinas QR
+
+Desde **Mi matrícula → Crear pegatina QR** se genera una pegatina para el cristal con un QR que lleva a:
+
+```
+https://euskonet.github.io/matricula-chat/#avisar=1234BCD
+```
+
+Quien la escanea ve una pantalla de **aviso rápido** con la matrícula y los avisos a un toque, desde el navegador y sin instalar nada. La matrícula va en el fragmento (`#`), que el navegador no envía al servidor, así que el hosting no sabe qué matrícula se ha escaneado.
+
+- **Web:** imprimir en A4 (6 de 7 cm, 12 de 5 cm o 4 de 9 cm por hoja), descargar PNG a 300 ppp o compartir el enlace.
+- **App Android:** compartir la imagen (para imprimirla o mandarla a una imprenta) o abrir la versión web para imprimir.
+- El diseño está en `src/sticker.js` (SVG). `test/e2e-sticker.mjs` genera el PNG, lee el QR con un lector y envía un aviso con el enlace.
+
 ## App móvil (Android e iOS)
 
 La app nativa es la misma app web empaquetada con [Capacitor](https://capacitorjs.com) (`android/` e `ios/`). Además usa notificaciones nativas.
