@@ -32,7 +32,7 @@ public class ScryptTest {
         String path = System.getenv("BG_FIXTURE");
         assumeTrue("sin fixture", path != null);
         JSONObject v = new JSONObject(new String(Files.readAllBytes(Paths.get(path)), "UTF-8")).getJSONObject("scryptVector");
-        RelayChecker.ClaimCandidate c = new RelayChecker.ClaimCandidate("x", "y", 0, v.getString("salt"), v.getString("proof"));
+        RelayChecker.ClaimCandidate c = new RelayChecker.ClaimCandidate("x", "y", 0, v.getString("salt"), v.getString("proof"), "t");
         assertEquals(true, RelayChecker.verifyProof(v.getString("plate"), c));
         assertEquals(false, RelayChecker.verifyProof("1016BCD", c));
     }

@@ -47,7 +47,7 @@ assert.match(summary, /4 de vinilo, 5 cm/);
 assert.match(summary, /Matrícula impresa\s*No/);
 assert.match(summary, /9,90 €/);
 const href = await P.getAttribute('[data-action=order-go]', 'href');
-assert.equal(href, 'https://buy.stripe.com/test_p4?client_reference_id=4321FGH-50-0&locale=es');
+assert.equal(href, 'https://buy.stripe.com/test_p4?client_reference_id=4321FGH-50-0-A0&locale=es');
 await P.screenshot({ path: 'shots/v2/17-confirmar-pedido.png', fullPage: true });
 step(`el resumen refleja las opciones y el enlace lleva el código de pedido: ${href}`);
 
@@ -56,7 +56,7 @@ await P.waitForSelector('.shop .pack');
 await P.click('[data-order=p2]');
 const [popup] = await Promise.all([P.waitForEvent('popup'), P.click('[data-action=order-go]')]);
 await popup.waitForLoadState();
-assert.equal(popup.url(), 'https://buy.stripe.com/test_p2?client_reference_id=4321FGH-50-0&locale=es');
+assert.equal(popup.url(), 'https://buy.stripe.com/test_p2?client_reference_id=4321FGH-50-0-A0&locale=es');
 step('«Ir a pagar» abre Stripe en una pestaña nueva');
 
 // 3) Ruta #pedido: la pegatina exacta del pedido, para imprimirla

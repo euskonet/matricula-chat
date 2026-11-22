@@ -38,10 +38,10 @@ public final class RelayChecker {
 
     /** Reclamación de mi cubo hecha por otra clave; falta verificar si es de MI matrícula. */
     public static final class ClaimCandidate {
-        public final String id, pubkey, salt, proof;
+        public final String id, pubkey, salt, proof, tag;
         public final long createdAt;
-        public ClaimCandidate(String id, String pubkey, long createdAt, String salt, String proof) {
-            this.id = id; this.pubkey = pubkey; this.createdAt = createdAt; this.salt = salt; this.proof = proof;
+        public ClaimCandidate(String id, String pubkey, long createdAt, String salt, String proof, String tag) {
+            this.id = id; this.pubkey = pubkey; this.createdAt = createdAt; this.salt = salt; this.proof = proof; this.tag = tag;
         }
     }
 
@@ -59,18 +59,21 @@ public final class RelayChecker {
 
     private RelayChecker() {}
 
+    /**
+     * @param blocked   remitentes bloqueados: sus mensajes no cuentan ni se notifican.
+     * @param plateTags cubos de mis matrículas activas.
+     * @param myPubs    claves de mis matrículas: sus reclamaciones (también desde un
+     *                  dispositivo vinculado) no son ajenas.
+     */
     public static Result check(OkHttpClient client, List<String> relays, Collection<String> pubkeys,
-                               String plateTag, String myPub, long since, long timeoutMs) {
-        return check(client, relays, pubkeys, Collections.emptySet(), plateTag, myPub, since, timeoutMs);
-    }
-
-    /** @param blocked remitentes bloqueados: sus mensajes no cuentan ni se notifican. */
-    public static Result check(OkHttpClient client, List<String> relays, Collection<String> pubkeys,
-                               Collection<String> blocked, String plateTag, String myPub, long since, long timeoutMs) {
+                               Collection<String> blocked, Collection<String> plateTags, Collection<String> myPubs,
+                               long since, long timeoutMs) {
         Set<String> blockedSet = new HashSet<>(blocked);
+        Set<String> tagSet = new HashSet<>(plateTags);
+        Set<String> mineSet = new HashSet<>(myPubs);
         Result result = new Result();
         Set<String> keys = new HashSet<>(pubkeys);
-        boolean watchClaims = plateTag != null && !plateTag.isEmpty() && myPub != null && !myPub.isEmpty();
+        boolean watchClaims = !tagSet.isEmpty();
         if (keys.isEmpty() && !watchClaims) return result;
 
         String req;
@@ -85,7 +88,7 @@ public final class RelayChecker {
             if (watchClaims) {
                 r.put(new JSONObject()
                         .put("kinds", new JSONArray().put(KIND_CLAIM))
-                        .put("#x", new JSONArray().put(plateTag))
+                        .put("#x", new JSONArray(tagSet))
                         .put("since", since));
             }
             req = r.toString();
@@ -114,7 +117,7 @@ public final class RelayChecker {
                                 ws.close(1000, null);
                                 finish.run();
                             } else if ("EVENT".equals(type)) {
-                                handleEvent(msg.getJSONObject(2), keys, blockedSet, plateTag, myPub, since, now, result);
+                                handleEvent(msg.getJSONObject(2), keys, blockedSet, tagSet, mineSet, since, now, result);
                             }
                         } catch (Exception ignored) {
                             // mensaje malformado de un relay: se ignora
@@ -138,7 +141,7 @@ public final class RelayChecker {
         return result;
     }
 
-    static void handleEvent(JSONObject ev, Set<String> keys, Set<String> blocked, String plateTag, String myPub,
+    static void handleEvent(JSONObject ev, Set<String> keys, Set<String> blocked, Set<String> plateTags, Set<String> myPubs,
                             long since, long now, Result result) {
         String id = ev.optString("id");
         long createdAt = ev.optLong("created_at");
@@ -149,9 +152,10 @@ public final class RelayChecker {
         if (kind == KIND_MSG && hasTag(tags, "p", keys)) {
             if (blocked.contains(ev.optString("pubkey"))) return;
             result.messages.put(id, createdAt);
-        } else if (kind == KIND_CLAIM && plateTag != null && hasTag(tags, "x", Collections.singleton(plateTag))) {
+        } else if (kind == KIND_CLAIM && hasTag(tags, "x", plateTags)) {
             String pubkey = ev.optString("pubkey");
-            if (myPub.equals(pubkey)) return;
+            if (myPubs.contains(pubkey)) return;
+            String tag = tagValue(tags, "x");
             if (leadingZeroBits(id) < CLAIM_POW) return; // sin prueba de trabajo: spam
             try {
                 JSONObject c = new JSONObject(ev.optString("content"));
@@ -160,7 +164,7 @@ public final class RelayChecker {
                 if ("release".equals(c.optString("action"))) return;
                 synchronized (result.foreignCandidates) {
                     for (ClaimCandidate x : result.foreignCandidates) if (x.id.equals(id)) return;
-                    result.foreignCandidates.add(new ClaimCandidate(id, pubkey, createdAt, s, p));
+                    result.foreignCandidates.add(new ClaimCandidate(id, pubkey, createdAt, s, p, tag));
                 }
             } catch (Exception ignored) {
                 // contenido malformado
@@ -195,6 +199,15 @@ public final class RelayChecker {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    private static String tagValue(JSONArray tags, String name) {
+        if (tags == null) return null;
+        for (int i = 0; i < tags.length(); i++) {
+            JSONArray t = tags.optJSONArray(i);
+            if (t != null && t.length() >= 2 && name.equals(t.optString(0))) return t.optString(1);
+        }
+        return null;
     }
 
     private static boolean hasTag(JSONArray tags, String name, Set<String> values) {

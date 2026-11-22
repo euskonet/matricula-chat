@@ -20,14 +20,17 @@ const ALLOWED_CHECKOUT = /^https:\/\/(buy\.stripe\.com|checkout\.stripe\.com)\//
 
 export const activePacks = (shop = SHOP) => shop.packs.filter(p => ALLOWED_CHECKOUT.test(p.url));
 
-/** Código de pedido que viaja a Stripe: matrícula, tamaño (mm) y si se imprime la matrícula. */
-export function orderRef(plate, sizeMm, showPlate) {
-  return `${plate}-${sizeMm}-${showPlate ? 1 : 0}`;
+/** Código de pedido que viaja a Stripe: matrícula, tamaño (mm), matrícula impresa, diseño (color + frase). */
+export function orderRef(plate, sizeMm, showPlate, theme = 'a', headline = '0') {
+  return `${plate}-${sizeMm}-${showPlate ? 1 : 0}-${theme.toUpperCase()}${headline}`;
 }
 
 export function parseOrderRef(ref) {
-  const m = /^([A-Z0-9]{4,10})-(50|70|90)-([01])$/.exec(String(ref || '').toUpperCase());
-  return m ? { plate: m[1], size: Number(m[2]), showPlate: m[3] === '1' } : null;
+  const m = /^([A-Z0-9]{4,10})-(50|70|90)-([01])(?:-([ANRVY])([0-2]))?$/.exec(String(ref || '').toUpperCase());
+  return m ? {
+    plate: m[1], size: Number(m[2]), showPlate: m[3] === '1',
+    theme: (m[4] || 'A').toLowerCase(), headline: m[5] || '0',
+  } : null;
 }
 
 /** URL de pago de Stripe con el código de pedido y la página en español. */

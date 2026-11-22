@@ -23,6 +23,9 @@ import androidx.work.WorkManager;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -82,11 +85,22 @@ public class CheckWorker extends Worker {
         Set<String> pubkeys = p.getStringSet("pubkeys", new HashSet<>());
         Set<String> blocked = p.getStringSet("blocked", new HashSet<>());
         List<String> relays = new ArrayList<>(p.getStringSet("relays", new HashSet<>()));
-        String plateTag = p.getString("plateTag", null);
-        String myPub = p.getString("myPub", null);
-        String plate = p.getString("plate", null);
+        // Mis matrículas activas: [{tag, plate, myPub}]
+        List<String[]> plates = new ArrayList<>();
+        try {
+            JSONArray arr = new JSONArray(p.getString("plates", "[]"));
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                plates.add(new String[] { o.getString("tag"), o.getString("plate"), o.getString("myPub") });
+            }
+        } catch (Exception ignored) {
+            // configuración vacía o antigua
+        }
         long seenAt = p.getLong("seenAt", System.currentTimeMillis() / 1000);
-        if (relays.isEmpty() || (pubkeys.isEmpty() && plateTag == null)) return Result.success();
+        if (relays.isEmpty() || (pubkeys.isEmpty() && plates.isEmpty())) return Result.success();
+
+        Set<String> tags = new HashSet<>(), myPubs = new HashSet<>();
+        for (String[] pl : plates) { tags.add(pl[0]); myPubs.add(pl[2]); }
 
         OkHttpClient client = new OkHttpClient.Builder()
                 .connectTimeout(10, TimeUnit.SECONDS)
@@ -94,7 +108,7 @@ public class CheckWorker extends Worker {
                 .build();
         RelayChecker.Result r;
         try {
-            r = RelayChecker.check(client, relays, pubkeys, blocked, plateTag, myPub, seenAt + 1, 25_000);
+            r = RelayChecker.check(client, relays, pubkeys, blocked, tags, myPubs, seenAt + 1, 25_000);
         } finally {
             client.dispatcher().executorService().shutdown();
             client.connectionPool().evictAll();
@@ -115,35 +129,43 @@ public class CheckWorker extends Worker {
             notified.addAll(r.messages.keySet());
         }
 
-        // ¿Ha reclamado alguien mi matrícula? En el cubo hay también otras
-        // matrículas: solo cuenta si la prueba scrypt coincide con la mía.
-        String lastClaimNotified = p.getString("claimNotified", "");
+        // ¿Ha reclamado alguien una de mis matrículas? En cada cubo hay también
+        // otras matrículas: solo cuenta si la prueba scrypt coincide.
+        Set<String> claimNotified = new HashSet<>(p.getStringSet("claimNotifiedIds", new HashSet<>()));
         Set<String> verdictsOk = new HashSet<>(p.getStringSet("claimOk", new HashSet<>()));
         Set<String> verdictsBad = new HashSet<>(p.getStringSet("claimBad", new HashSet<>()));
-        RelayChecker.ClaimCandidate foreign = plate == null ? null : RelayChecker.newestForeignClaim(r.foreignCandidates, c -> {
-            String key = c.pubkey + ":" + c.salt;
-            if (verdictsOk.contains(key)) return true;
-            if (verdictsBad.contains(key)) return false;
-            boolean ok = RelayChecker.verifyProof(plate, c);
-            (ok ? verdictsOk : verdictsBad).add(key);
-            return ok;
-        }, 5);
-        boolean claimAlert = foreign != null && !foreign.id.equals(lastClaimNotified);
-        if (claimAlert) {
-            notify(ctx, NOTIF_CLAIM, "Otro dispositivo ha reclamado tu matrícula",
-                    "Abre la app para comprobarlo y recuperarla si no has sido tú.");
+        int notifId = NOTIF_CLAIM;
+        for (String[] pl : plates) {
+            final String tag = pl[0], plate = pl[1];
+            List<RelayChecker.ClaimCandidate> mine = new ArrayList<>();
+            for (RelayChecker.ClaimCandidate c : r.foreignCandidates) if (tag.equals(c.tag)) mine.add(c);
+            RelayChecker.ClaimCandidate foreign = RelayChecker.newestForeignClaim(mine, c -> {
+                String key = plate + ":" + c.pubkey + ":" + c.salt;
+                if (verdictsOk.contains(key)) return true;
+                if (verdictsBad.contains(key)) return false;
+                boolean ok = RelayChecker.verifyProof(plate, c);
+                (ok ? verdictsOk : verdictsBad).add(key);
+                return ok;
+            }, 5);
+            notifId++;
+            if (foreign != null && claimNotified.add(foreign.id)) {
+                notify(ctx, notifId, "Otro dispositivo ha reclamado " + plate,
+                        "Abre la app para comprobarlo y recuperarla si no has sido tú.");
+            }
         }
 
         List<String> keep = new ArrayList<>(notified);
         keep.remove("");
         if (keep.size() > MAX_REMEMBERED) keep = keep.subList(keep.size() - MAX_REMEMBERED, keep.size());
-        SharedPreferences.Editor ed = p.edit()
-                .putString("notified", android.text.TextUtils.join(",", keep))
-                .putInt("pendingCount", pending);
-        if (claimAlert) ed.putString("claimNotified", foreign.id);
         if (verdictsBad.size() > MAX_REMEMBERED) verdictsBad.clear();
-        ed.putStringSet("claimOk", verdictsOk).putStringSet("claimBad", verdictsBad);
-        ed.apply();
+        if (claimNotified.size() > MAX_REMEMBERED) claimNotified.clear();
+        p.edit()
+                .putString("notified", android.text.TextUtils.join(",", keep))
+                .putInt("pendingCount", pending)
+                .putStringSet("claimNotifiedIds", claimNotified)
+                .putStringSet("claimOk", verdictsOk)
+                .putStringSet("claimBad", verdictsBad)
+                .apply();
         return Result.success();
     }
 

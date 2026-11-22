@@ -1,7 +1,7 @@
 import {
   SimplePool, finalizeEvent, generateSecretKey, getPublicKey, nip44, minePow,
   scryptAsync, bytesToHex, hexToBytes, Capacitor, LocalNotifications, registerPlugin,
-  qrcode, Share, Filesystem, Directory, sha256,
+  qrcode, Share, Filesystem, Directory, sha256, jsQR,
 } from './vendor.js';
 import {
   KIND_CLAIM, KIND_MSG, PARAMS, PLATE_KDF, PRESETS, presetText,
@@ -9,8 +9,9 @@ import {
   sendWait, inboundAllowed, bucketTag, proofInput, parseClaim, leadingZeroBits,
 } from './protocol.js';
 import { analyze, checkOutgoing } from './moderation.js';
-import { WEB_URL, quickLink, parseHash, stickerSvg } from './sticker.js';
+import { WEB_URL, quickLink, parseHash, stickerSvg, qrPath, THEMES, HEADLINES } from './sticker.js';
 import { SHOP, activePacks, orderRef, checkoutUrl } from './shop.js';
+import { PRO, encodePairing, decodePairing, validateReply } from './pro.js';
 
 // ---------- Configuración ----------
 
@@ -38,6 +39,8 @@ const pool = new SimplePool({ enablePing: true, enableReconnect: true });
 const isNative = Capacitor.isNativePlatform();
 // Plugin nativo propio (android/.../BackgroundCheckPlugin.java). Solo existe en la app.
 const BackgroundCheck = isNative && Capacitor.getPlatform() === 'android' ? registerPlugin('BackgroundCheck') : null;
+// Plugin nativo propio (android/.../BillingPlugin.java): compras de Google Play.
+const Billing = isNative && Capacitor.getPlatform() === 'android' ? registerPlugin('Billing') : null;
 const now = () => Math.floor(Date.now() / 1000);
 
 // ---------- Almacenamiento local (solo en este dispositivo) ----------
@@ -45,9 +48,14 @@ const now = () => Math.floor(Date.now() / 1000);
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(STORE_KEY));
-    if (s && typeof s === 'object') return { plate: null, threads: {}, seen: [], blocked: [], ...s };
+    if (s && typeof s === 'object') {
+      const st = { plates: [], threads: {}, seen: [], blocked: [], replies: [], pro: false, ...s };
+      if (s.plate && !s.plates) st.plates = [s.plate]; // formato con una sola matrícula
+      delete st.plate;
+      return st;
+    }
   } catch {}
-  return { plate: null, threads: {}, seen: [], blocked: [] };
+  return { plates: [], threads: {}, seen: [], blocked: [], replies: [], pro: false };
 }
 const store = load();
 const seen = new Set(store.seen);
@@ -119,12 +127,12 @@ async function resolvePlate(plate) {
   return { tag, latest: latestOf(mineEvs), ...resolveClaims(mineEvs, () => true, now()) };
 }
 
-// Fecha más reciente de las reclamaciones conocidas de mi matrícula.
-const latestClaimAt = () => latestOf([...claimEvents.values()]);
+// Fecha más reciente de las reclamaciones conocidas de una de mis matrículas.
+const latestClaimAt = plate => latestOf([...(rt(plate)?.events.values() || [])]);
 
 const tick = () => new Promise(r => setTimeout(r, 30));
 
-async function publishClaim(action, { plate, sk: skHex, salt, proof }, after = latestClaimAt()) {
+async function publishClaim(action, { plate, sk: skHex, salt, proof }, after = latestClaimAt(plate)) {
   // Siempre posterior a la última reclamación conocida: si dos reclamaciones
   // cayeran en el mismo segundo, el desempate podría ordenarlas al revés.
   const unsigned = {
@@ -137,7 +145,7 @@ async function publishClaim(action, { plate, sk: skHex, salt, proof }, after = l
   const ev = finalizeEvent(mined, hexToBytes(skHex));
   await publish(ev);
   verdicts.set(`${plate}|${ev.id}`, true);
-  if (store.plate?.plate === plate) claimEvents.set(ev.id, ev);
+  rt(plate)?.events.set(ev.id, ev);
   return ev;
 }
 
@@ -167,82 +175,92 @@ async function sendRaw(thread, payload) {
     tags: [['p', thread.peer], ['expiration', String(now() + PARAMS.msgTtl)]],
     content: encryptFor(thread.sk, thread.peer, { v: 1, ...payload }),
   }, hexToBytes(thread.sk));
+  // Mis matrículas reciben su propio eco (para sincronizar dispositivos vinculados):
+  // aquí ya lo tengo, así que se marca como visto antes de publicar.
+  seen.add(ev.id);
   await publish(ev);
-  thread.messages.push({ id: ev.id, from: 'me', ...payload, at: ev.created_at });
+  if (!thread.messages.some(m => m.id === ev.id)) thread.messages.push({ id: ev.id, from: 'me', ...payload, at: ev.created_at });
   thread.updated = ev.created_at;
   save();
 }
 
-// ---------- Mi matrícula: reclamar, liberar, detectar expulsión ----------
+// ---------- Mis matrículas: reclamar, liberar, detectar expulsión ----------
+// Cada matrícula tiene su propio estado (reclamaciones verificadas, suscripción,
+// situación). Versión gratuita: 1 matrícula; Pro: hasta PRO.maxPlatesPro.
 
-let claimEvents = new Map();
-let claimsReady = false;
-let claimSub = null;
-let mine = { status: 'none' }; // none | active | lost | disputed | free
-let pendingMsgs = [];
+const plateRt = new Map(); // matrícula → { obj, events, ready, sub, mine, pending }
+const rt = plate => plateRt.get(plate);
+const findPlate = plate => store.plates.find(p => p.plate === plate);
+const findPlateByPub = pub => store.plates.find(p => pubOf(p.sk) === pub);
+const myPlatePubs = () => store.plates.map(p => pubOf(p.sk));
+const isPro = () => store.pro === true;
+const maxPlates = () => (isPro() ? PRO.maxPlatesPro : PRO.maxPlatesFree);
+const plateStatus = plate => rt(plate)?.mine.status ?? 'none'; // none | active | lost | disputed | free
+const allPlatesReady = () => store.plates.every(p => rt(p.plate)?.ready);
 
-function recomputeMine() {
-  if (!store.plate) { mine = { status: 'none' }; return; }
-  const r = resolveClaims([...claimEvents.values()], () => true, now());
-  const myPub = pubOf(store.plate.sk);
-  const prev = mine.status;
-  if (r.status === 'held' && r.holder === myPub) mine = { ...r, status: 'active' };
-  else if (r.status === 'disputed') mine = { ...r, status: 'disputed' };
-  else if (r.status === 'held') mine = { ...r, status: 'lost' };
-  else mine = { ...r, status: 'free' };
+function recomputePlate(p) {
+  const s = rt(p.plate);
+  if (!s) return;
+  const r = resolveClaims([...s.events.values()], () => true, now());
+  const myPub = pubOf(p.sk);
+  const prev = s.mine.status;
+  if (r.status === 'held' && r.holder === myPub) s.mine = { ...r, status: 'active' };
+  else if (r.status === 'disputed') s.mine = { ...r, status: 'disputed' };
+  else if (r.status === 'held') s.mine = { ...r, status: 'lost' };
+  else s.mine = { ...r, status: 'free' };
 
-  if (prev === 'active' && mine.status !== 'active') {
-    closeThreads(t => t.role === 'holder', mine.status === 'disputed' ? 'disputed' : 'kicked');
-    notify(mine.status === 'disputed'
-      ? `La matrícula ${store.plate.plate} está en disputa`
-      : `Otro dispositivo ha reclamado ${store.plate.plate}`,
-    'Has dejado de recibir mensajes en este dispositivo.');
+  if (prev === 'active' && s.mine.status !== 'active') {
+    closeThreads(t => t.role === 'holder' && t.plate === p.plate, s.mine.status === 'disputed' ? 'disputed' : 'kicked');
+    notify(s.mine.status === 'disputed'
+      ? `La matrícula ${p.plate} está en disputa`
+      : `Otro dispositivo ha reclamado ${p.plate}`,
+    'Has dejado de recibir sus mensajes en este dispositivo.');
   }
-  if (mine.status === 'active' && now() - mine.lastSeen > PARAMS.claimRefresh) {
-    publishClaim('claim', store.plate).then(recomputeMine).catch(() => {});
+  if (s.mine.status === 'active' && now() - s.mine.lastSeen > PARAMS.claimRefresh) {
+    publishClaim('claim', p).then(() => recomputePlate(p)).catch(() => {});
   }
 }
+const recomputeAll = () => store.plates.forEach(recomputePlate);
 
 // Matrículas registradas con el formato anterior: se les genera sal y prueba
 // y, al terminar de cargar, se vuelven a reclamar con la misma clave.
-async function upgradePlate() {
-  const p = store.plate;
-  if (!p || (p.v === 2 && p.salt && p.proof)) return;
-  p.salt = randomHex(16);
-  p.proof = await proofFor(p.plate, p.salt);
-  p.tag = bucketOf(p.plate);
-  p.v = 2;
-  p.migrate = true;
+async function upgradePlates() {
+  for (const p of store.plates) {
+    if (p.v === 2 && p.salt && p.proof) continue;
+    p.salt = randomHex(16);
+    p.proof = await proofFor(p.plate, p.salt);
+    p.tag = bucketOf(p.plate);
+    p.v = 2;
+    p.migrate = true;
+  }
   save();
 }
 
-function watchMyPlate() {
-  claimSub?.close();
-  claimEvents = new Map();
-  claimsReady = false;
-  if (!store.plate) { recomputeMine(); render(); return; }
-  const mineObj = store.plate;
+function startPlate(p) {
+  const s = { obj: p, events: new Map(), ready: false, sub: null, mine: { status: 'none' }, pending: [] };
+  plateRt.set(p.plate, s);
   // Los eventos del cubo se verifican en serie (scrypt), en orden de llegada.
   let queue = Promise.resolve();
   const later = fn => { queue = queue.then(fn).catch(() => {}); };
-  claimSub = pool.subscribe(relays, { kinds: [KIND_CLAIM], '#x': [bucketOf(mineObj.plate)] }, {
+  const alive = () => rt(p.plate) === s;
+  s.sub = pool.subscribe(relays, { kinds: [KIND_CLAIM], '#x': [bucketOf(p.plate)] }, {
     onevent(ev) {
       later(async () => {
-        if (store.plate !== mineObj || !(await claimBelongs(mineObj.plate, ev))) return;
-        claimEvents.set(ev.id, ev);
-        if (claimsReady) { recomputeMine(); render(); }
+        if (!alive() || !(await claimBelongs(p.plate, ev))) return;
+        s.events.set(ev.id, ev);
+        if (s.ready) { recomputePlate(p); render(); }
       });
     },
     oneose() {
       later(async () => {
-        if (claimsReady || store.plate !== mineObj) return;
-        if (mineObj.migrate) {
-          delete mineObj.migrate; save();
-          try { await publishClaim('claim', mineObj); } catch {}
+        if (s.ready || !alive()) return;
+        if (p.migrate) {
+          delete p.migrate; save();
+          try { await publishClaim('claim', p); } catch {}
         }
-        claimsReady = true;
-        recomputeMine();
-        const queued = pendingMsgs; pendingMsgs = [];
+        s.ready = true;
+        recomputePlate(p);
+        const queued = s.pending; s.pending = [];
         queued.forEach(handleMsg);
         render();
       });
@@ -250,37 +268,76 @@ function watchMyPlate() {
   });
 }
 
+function stopPlate(plate) {
+  rt(plate)?.sub?.close();
+  plateRt.delete(plate);
+}
+
+/** Arranca o para las suscripciones según store.plates. */
+function watchPlates() {
+  for (const plate of [...plateRt.keys()]) {
+    const s = rt(plate);
+    if (!store.plates.includes(s.obj)) stopPlate(plate);
+  }
+  for (const p of store.plates) if (!rt(p.plate)) startPlate(p);
+  render();
+}
+
+function restartPlate(plate) { stopPlate(plate); watchPlates(); }
+
 async function claimPlate(input) {
   const plate = normalizePlate(input);
   if (!isValidPlate(plate)) throw new Error('Matrícula no válida.');
+  const existing = findPlate(plate);
+  if (!existing && store.plates.length >= maxPlates()) {
+    throw new Error(isPro()
+      ? `Puedes tener hasta ${PRO.maxPlatesPro} matrículas.`
+      : 'Con la versión gratuita puedes registrar una matrícula. Hazte Pro para añadir más.');
+  }
   setBusy('Comprobando matrícula…');
   const r = await resolvePlate(plate);
   if (r.status === 'disputed') {
     throw new Error(`Esta matrícula está en disputa hasta ${fmtDate(r.frozenUntil)}. Inténtalo después.`);
   }
-  // Misma matrícula en este dispositivo: reutiliza clave y sal. Otra: nuevas.
-  const same = store.plate?.plate === plate && store.plate.salt;
-  const sk = same ? store.plate.sk : bytesToHex(generateSecretKey());
-  const salt = same ? store.plate.salt : randomHex(16);
-  if (store.plate && store.plate.plate !== plate) await releasePlate(false);
+  // Misma matrícula: reutiliza clave y sal (también si viene de otro dispositivo vinculado).
+  const sk = existing?.salt ? existing.sk : bytesToHex(generateSecretKey());
+  const salt = existing?.salt || randomHex(16);
   setBusy('Generando prueba de trabajo…');
   const proof = await proofFor(plate, salt);
-  store.plate = { plate, tag: r.tag, sk, salt, proof, v: 2 };
+  const obj = { plate, tag: r.tag, sk, salt, proof, v: 2 };
+  if (existing) Object.assign(existing, obj); else store.plates.push(obj);
   save();
-  await publishClaim('claim', store.plate, r.latest);
-  watchMyPlate();
+  await publishClaim('claim', existing || obj, r.latest);
+  restartPlate(plate);
 }
 
-async function releasePlate(rerender = true) {
-  if (!store.plate) return;
-  if (mine.status === 'active') {
+async function releasePlate(p) {
+  if (!p) return;
+  if (plateStatus(p.plate) === 'active') {
     setBusy('Liberando…');
-    try { await publishClaim('release', store.plate); } catch {}
+    try { await publishClaim('release', p); } catch {}
   }
-  closeThreads(t => t.role === 'holder', 'released');
-  store.plate = null;
+  closeThreads(t => t.role === 'holder' && t.plate === p.plate, 'released');
+  store.plates = store.plates.filter(x => x !== p);
   save();
-  if (rerender) watchMyPlate();
+  watchPlates();
+}
+
+/** Añade una matrícula desde el código de vinculación de otro dispositivo. */
+async function linkPlate(pairing) {
+  if (findPlate(pairing.plate)) throw new Error('Esa matrícula ya está en este dispositivo.');
+  if (store.plates.length >= maxPlates()) {
+    throw new Error(isPro()
+      ? `Puedes tener hasta ${PRO.maxPlatesPro} matrículas.`
+      : 'Con la versión gratuita puedes tener una matrícula. Libera la actual o hazte Pro.');
+  }
+  // Misma clave que el otro dispositivo: para el protocolo son el mismo titular,
+  // así que no hace falta publicar ninguna reclamación nueva.
+  setBusy('Vinculando…');
+  const proof = await proofFor(pairing.plate, pairing.salt);
+  store.plates.push({ plate: pairing.plate, tag: bucketOf(pairing.plate), sk: pairing.sk, salt: pairing.salt, proof, v: 2, linked: true });
+  save();
+  watchPlates();
 }
 
 function closeThreads(pred, reason) {
@@ -294,52 +351,96 @@ let msgSub = null;
 let msgSubKeys = '';
 
 function myInboxKeys() {
-  const keys = [];
-  if (store.plate) keys.push(pubOf(store.plate.sk));
+  const keys = myPlatePubs();
   for (const t of Object.values(store.threads)) if (t.role === 'sender' && !t.closed) keys.push(t.myPub);
   return [...new Set(keys)].sort();
 }
 
+// Dos suscripciones: lo que me envían (#p) y lo que envían mis matrículas desde
+// otro dispositivo vinculado (authors), para ver sus respuestas aquí también.
+let ownSub = null;
+let ownSubKeys = '';
+
 function watchInbox() {
   const keys = myInboxKeys();
   const sig = keys.join(',');
-  if (sig === msgSubKeys) return;
-  msgSubKeys = sig;
-  msgSub?.close();
-  msgSub = null;
-  if (!keys.length) return;
-  msgSub = pool.subscribe(relays, { kinds: [KIND_MSG], '#p': keys, since: now() - PARAMS.msgTtl }, {
-    onevent: handleMsg,
-  });
+  if (sig !== msgSubKeys) {
+    msgSubKeys = sig;
+    msgSub?.close();
+    msgSub = null;
+    if (keys.length) {
+      msgSub = pool.subscribe(relays, { kinds: [KIND_MSG], '#p': keys, since: now() - PARAMS.msgTtl }, { onevent: handleMsg });
+    }
+  }
+  const own = myPlatePubs().sort();
+  const ownSig = own.join(',');
+  if (ownSig !== ownSubKeys) {
+    ownSubKeys = ownSig;
+    ownSub?.close();
+    ownSub = null;
+    if (own.length) {
+      ownSub = pool.subscribe(relays, { kinds: [KIND_MSG], authors: own, since: now() - PARAMS.msgTtl }, { onevent: handleMsg });
+    }
+  }
 }
 
 function handleMsg(ev) {
   if (seen.has(ev.id)) return;
   const p = ev.tags.find(t => t[0] === 'p')?.[1];
   if (ev.created_at > now() + PARAMS.maxFutureSkew) return;
-  if (store.blocked.includes(ev.pubkey)) { seen.add(ev.id); save(); return; }
   const peerTimes = t => (t ? t.messages.filter(m => m.from === 'peer').map(m => m.at) : []);
 
-  // 1) Mensaje para mi matrícula
-  if (store.plate && p === pubOf(store.plate.sk)) {
-    if (!claimsReady) { pendingMsgs.push(ev); return; }
+  // 0) Lo que ha contestado una de mis matrículas (desde este u otro dispositivo vinculado)
+  const author = findPlateByPub(ev.pubkey);
+  if (author) {
     seen.add(ev.id);
-    if (mine.status !== 'active') { save(); return; } // ya no soy el titular
+    const s = rt(author.plate);
+    if (!s?.ready || s.mine.status !== 'active' || !p || store.blocked.includes(p)) { save(); return; }
+    const msg = validateMessage(decryptFrom(author.sk, p, ev.content), { allowText: true });
+    if (!msg) { save(); return; }
+    const id = 'in:' + p;
+    let t = store.threads[id];
+    if (t?.closed) { save(); return; }
+    if (!t) {
+      t = store.threads[id] = {
+        id, role: 'holder', plate: author.plate, sk: author.sk, myPub: ev.pubkey, peer: p, messages: [], created: ev.created_at,
+      };
+    }
+    if (!t.messages.some(m => m.id === ev.id)) {
+      t.messages.push({ id: ev.id, from: 'me', ...msg, at: ev.created_at });
+      t.messages.sort((a, b) => a.at - b.at);
+      t.updated = Math.max(t.updated || 0, ev.created_at);
+    }
+    t.meReplied = true;
+    save();
+    render();
+    return;
+  }
+
+  if (store.blocked.includes(ev.pubkey)) { seen.add(ev.id); save(); return; }
+
+  // 1) Mensaje para una de mis matrículas
+  const target = findPlateByPub(p);
+  if (target) {
+    const s = rt(target.plate);
+    if (!s?.ready) { s?.pending.push(ev); return; }
+    seen.add(ev.id);
+    if (s.mine.status !== 'active') { save(); return; } // ya no soy el titular
     const id = 'in:' + ev.pubkey;
     let t = store.threads[id];
     if (t?.closed) { save(); return; }
-    const starts = Object.values(store.threads).filter(x => x.role === 'holder').map(x => x.created);
+    const starts = Object.values(store.threads).filter(x => x.role === 'holder' && x.plate === target.plate).map(x => x.created);
     if (!inboundAllowed({ times: peerTimes(t), t: ev.created_at, replied: !!t?.meReplied, newThread: !t, threadStarts: starts })) {
       save(); return; // demasiados mensajes: se descarta
     }
-    const msg = validateMessage(decryptFrom(store.plate.sk, ev.pubkey, ev.content), {
+    const msg = validateMessage(decryptFrom(target.sk, ev.pubkey, ev.content), {
       allowText: !!t?.meReplied,
     });
     if (!msg) { save(); return; } // texto libre antes de contestar, o basura: se descarta
     if (!t) {
       t = store.threads[id] = {
-        id, role: 'holder', plate: store.plate.plate, sk: store.plate.sk,
-        myPub: pubOf(store.plate.sk), peer: ev.pubkey, messages: [], created: ev.created_at,
+        id, role: 'holder', plate: target.plate, sk: target.sk,
+        myPub: p, peer: ev.pubkey, messages: [], created: ev.created_at,
       };
     }
     t.messages.push({ id: ev.id, from: 'peer', ...msg, at: ev.created_at });
@@ -373,10 +474,10 @@ async function startConversation(input, presetId) {
   const plate = normalizePlate(input);
   if (!isValidPlate(plate)) throw new Error('Matrícula no válida.');
   assertCanSend();
+  if (findPlate(plate)) throw new Error('Es tu propia matrícula.');
   setBusy('Buscando matrícula…');
-  if (store.plate?.plate === plate) throw new Error('Es tu propia matrícula.');
   const r = await resolvePlate(plate);
-  if (store.plate && r.holder === pubOf(store.plate.sk)) throw new Error('Es tu propia matrícula.');
+  if (myPlatePubs().includes(r.holder)) throw new Error('Es tu propia matrícula.');
   // Una clave efímera nueva por conversación: el remitente es anónimo y
   // sus conversaciones no se pueden relacionar entre sí.
   const sk = bytesToHex(generateSecretKey());
@@ -415,16 +516,19 @@ async function sendInThread(id, payload) {
     const r = await resolvePlate(t.plate);
     if (!t.peer) {
       // Conversación con una matrícula sin titular: si ahora lo tiene, se le empieza a entregar.
-      if (r.status === 'held' && r.holder !== (store.plate && pubOf(store.plate.sk))) { t.peer = r.holder; save(); }
+      if (r.status === 'held' && !myPlatePubs().includes(r.holder)) { t.peer = r.holder; save(); }
     } else if (r.status !== 'held' || r.holder !== t.peer) {
       t.closed = r.status === 'disputed' ? 'disputed' : 'changed';
       save();
       throw new Error(closedReason(t.closed));
     }
     if (!t.peer) { await sendPhantom(t, payload); return; }
-  } else if (mine.status !== 'active' || store.plate?.sk !== t.sk) {
-    t.closed = 'kicked'; save();
-    throw new Error(closedReason('kicked'));
+  } else {
+    const mineP = store.plates.find(p => p.sk === t.sk);
+    if (!mineP || plateStatus(mineP.plate) !== 'active') {
+      t.closed = 'kicked'; save();
+      throw new Error(closedReason('kicked'));
+    }
   }
   await sendRaw(t, payload);
   if (t.role === 'holder') { t.meReplied = true; save(); }
@@ -475,18 +579,16 @@ document.addEventListener('visibilitychange', () => {
 
 let bgSig = '';
 function syncBackground() {
-  if (!BackgroundCheck || (store.plate && !claimsReady)) return;
-  const active = !!store.plate && mine.status === 'active';
+  if (!BackgroundCheck || !allPlatesReady()) return;
+  const active = store.plates.filter(p => plateStatus(p.plate) === 'active');
   const pubkeys = Object.values(store.threads)
     .filter(t => t.role === 'sender' && !t.closed).map(t => t.myPub);
-  if (active) pubkeys.push(pubOf(store.plate.sk));
+  pubkeys.push(...active.map(p => pubOf(p.sk)));
   const cfg = {
     pubkeys: [...new Set(pubkeys)].sort(),
     relays,
     blocked: [...store.blocked].sort(),
-    plateTag: active ? bucketOf(store.plate.plate) : null,
-    plate: active ? store.plate.plate : null,
-    myPub: active ? pubOf(store.plate.sk) : null,
+    plates: active.map(p => ({ tag: bucketOf(p.plate), plate: p.plate, myPub: pubOf(p.sk) })),
   };
   const sig = JSON.stringify(cfg);
   if (sig === bgSig) return;
@@ -558,6 +660,7 @@ function closedReason(r) {
     kicked: 'Otro dispositivo ha reclamado tu matrícula. Esta conversación se ha cerrado.',
     released: 'Liberaste la matrícula. Esta conversación se ha cerrado.',
     blocked: 'Has bloqueado esta conversación. No recibirás más mensajes de esta persona.',
+    rekeyed: 'Cambiaste la clave de la matrícula. Esta conversación se ha cerrado.',
   }[r] || 'Conversación cerrada.';
 }
 
@@ -569,8 +672,39 @@ async function run(fn) {
   render();
 }
 
-function renderMyPlate() {
-  if (!store.plate) {
+function plateCard(p, single) {
+  const s = rt(p.plate);
+  const m = s?.mine || { status: 'none' };
+  const attr = `data-plate="${esc(p.plate)}"`;
+  let status;
+  if (!s?.ready) status = `<p class="status">Comprobando estado…</p>`;
+  else if (m.status === 'active') status = `<p class="status ok">● Recibiendo mensajes desde ${fmtDate(m.since)}</p>
+      <div class="actions plate-actions">
+        <button class="secondary" data-action="sticker" ${attr}>Pegatina QR</button>
+        <button class="secondary" data-action="pair" ${attr}>Vincular dispositivo${isPro() ? '' : ' · Pro'}</button>
+      </div>`;
+  else if (m.status === 'disputed') status = `
+      <div class="banner warn"><strong>Matrícula en disputa</strong>
+      Ha cambiado de dispositivo demasiadas veces en 24 h. Nadie recibe mensajes hasta ${fmtDate(m.frozenUntil)}.</div>`;
+  else if (m.status === 'lost') status = `
+      <div class="banner danger"><strong>Otro dispositivo ha reclamado esta matrícula</strong>
+      Has dejado de recibir mensajes. Si no has sido tú, recupérala. Si vuelve a pasar, la matrícula quedará en disputa.</div>
+      <button data-action="reclaim" ${attr}>Recuperar matrícula</button>`;
+  else status = `<div class="banner">Esta matrícula ya no está activa.</div><button data-action="reclaim" ${attr}>Volver a registrarla</button>`;
+  return `
+    <section class="card plate-card">
+      <div class="between">
+        <h2>${single ? 'Mi matrícula' : ''}${p.linked ? ' <span class="pill">Vinculada</span>' : ''}</h2>
+        <button class="link" data-action="release" ${attr}>Liberar</button>
+      </div>
+      <div class="center">${plateBadge(p.plate, 'big')}</div>
+      ${status}
+    </section>`;
+}
+
+function renderMyPlates() {
+  const linkBtn = '<button class="link small-link" data-action="link">¿Ya la tienes en otro móvil? Vincular este dispositivo</button>';
+  if (!store.plates.length) {
     return `
       <section class="card">
         <h2>Mi matrícula</h2>
@@ -579,27 +713,26 @@ function renderMyPlate() {
           <input name="plate" placeholder="1234 BCD" autocomplete="off" autocapitalize="characters" maxlength="12" required>
           <button>Registrar</button>
         </form>
+        ${linkBtn}
       </section>`;
   }
-  const p = store.plate.plate;
-  let status;
-  if (!claimsReady) status = `<p class="status">Comprobando estado…</p>`;
-  else if (mine.status === 'active') status = `<p class="status ok">● Recibiendo mensajes desde ${fmtDate(mine.since)}</p>
-      <button class="secondary wide" data-action="sticker">Crear pegatina QR para el coche</button>`;
-  else if (mine.status === 'disputed') status = `
-      <div class="banner warn"><strong>Matrícula en disputa</strong>
-      Ha cambiado de dispositivo demasiadas veces en 24 h. Nadie recibe mensajes hasta ${fmtDate(mine.frozenUntil)}.</div>`;
-  else if (mine.status === 'lost') status = `
-      <div class="banner danger"><strong>Otro dispositivo ha reclamado esta matrícula</strong>
-      Has dejado de recibir mensajes. Si no has sido tú, recupérala. Si vuelve a pasar, la matrícula quedará en disputa.</div>
-      <button data-action="reclaim">Recuperar matrícula</button>`;
-  else status = `<div class="banner">Esta matrícula ya no está activa.</div><button data-action="reclaim">Volver a registrarla</button>`;
-  return `
-    <section class="card">
-      <div class="between"><h2>Mi matrícula</h2><button class="link" data-action="release">Liberar</button></div>
-      <div class="center">${plateBadge(p, 'big')}</div>
-      ${status}
-    </section>`;
+  const single = store.plates.length === 1;
+  const cards = store.plates.map(p => plateCard(p, single)).join('');
+  let add = '';
+  if (store.plates.length < maxPlates()) {
+    add = `
+      <section class="card">
+        <h2>Añadir otra matrícula</h2>
+        <form data-action="claim" class="row">
+          <input name="plate" placeholder="5678 FGH" autocomplete="off" autocapitalize="characters" maxlength="12" required>
+          <button>Añadir</button>
+        </form>
+        ${linkBtn}
+      </section>`;
+  } else if (!isPro()) {
+    add = '<button class="secondary wide upsell" data-action="pro">＋ Añadir otra matrícula · Pro</button>';
+  }
+  return (single ? '' : '<h2 class="section-title">Mis matrículas</h2>') + cards + add;
 }
 
 function renderCompose() {
@@ -667,7 +800,8 @@ function renderThread(t) {
     </section>
     ${t.closed ? '' : `
     <footer class="composer">
-      <div class="presets inline">${quick.map(x => `<button data-preset="${x.id}">${esc(x.es)}</button>`).join('')}</div>
+      <div class="presets inline">${quick.map(x => `<button data-preset="${x.id}">${esc(x.es)}</button>`).join('')}${
+        isPro() && canText ? store.replies.map((r, i) => `<button class="mine" data-reply="${i}">${esc(r)}</button>`).join('') : ''}</div>
       <form data-action="text" class="row">
         <input name="text" maxlength="${PARAMS.maxText}" autocomplete="off" ${canText ? 'placeholder="Escribe un mensaje…"' : 'disabled placeholder="Podrás escribir cuando conteste"'}>
         <button ${canText ? '' : 'disabled'}>Enviar</button>
@@ -745,11 +879,13 @@ function renderQuick(plate) {
 
 // ---------- Pegatinas QR ----------
 
-const stickerOpts = { size: 70, copies: 6, showPlate: true };
+const stickerOpts = { size: 70, copies: 6, showPlate: true, theme: 'a', headline: '0', fromOrder: false };
+// Diseño efectivo: los de pago solo con Pro (o al abrir un pedido ya pagado).
+const stickerDesign = () => (isPro() || stickerOpts.fromOrder ? { theme: stickerOpts.theme, headline: stickerOpts.headline } : { theme: 'a', headline: '0' });
 // En la app nativa el QR apunta a la web pública; en la web, a donde se esté sirviendo.
 const stickerUrl = plate => quickLink(isNative ? WEB_URL : location.href, plate);
 const currentSticker = (plate, widthMm = stickerOpts.size) =>
-  stickerSvg({ qrcode, url: stickerUrl(plate), plate, showPlate: stickerOpts.showPlate, widthMm });
+  stickerSvg({ qrcode, url: stickerUrl(plate), plate, showPlate: stickerOpts.showPlate, widthMm, ...stickerDesign() });
 
 function renderSticker(plate) {
   const opt = (v, cur, label = v) => `<option value="${v}" ${String(v) === String(cur) ? 'selected' : ''}>${label}</option>`;
@@ -762,6 +898,9 @@ function renderSticker(plate) {
         <label>Tamaño <select name="size">${opt(50, stickerOpts.size, '5 cm')}${opt(70, stickerOpts.size, '7 cm')}${opt(90, stickerOpts.size, '9 cm')}</select></label>
         ${isNative ? '' : `<label>Copias <select name="copies">${[1, 2, 4, 6, 9, 12].map(n => opt(n, stickerOpts.copies)).join('')}</select></label>`}
         <label class="check"><input type="checkbox" name="showPlate" ${stickerOpts.showPlate ? 'checked' : ''}> Mostrar la matrícula</label>
+        <label>Color <select name="theme" ${isPro() || stickerOpts.fromOrder ? '' : 'disabled'}>${THEMES.map(x => opt(x.id, stickerDesign().theme, x.name)).join('')}</select></label>
+        <label>Frase <select name="headline" ${isPro() || stickerOpts.fromOrder ? '' : 'disabled'}>${HEADLINES.map(x => opt(x.id, stickerDesign().headline, esc(x.lines.join(' ')))).join('')}</select></label>
+        ${isPro() || stickerOpts.fromOrder ? '' : '<button type="button" class="link small-link" data-action="pro">Más colores y frases con Pro</button>'}
       </form>
       <div class="actions">
         ${isNative
@@ -785,7 +924,8 @@ function renderShop(plate) {
   if (!packs.length) return '';
   const pack = packs.find(p => p.id === orderPack);
   if (pack) {
-    const href = checkoutUrl(pack, orderRef(plate, stickerOpts.size, stickerOpts.showPlate));
+    const d = stickerDesign();
+    const href = checkoutUrl(pack, orderRef(plate, stickerOpts.size, stickerOpts.showPlate, d.theme, d.headline));
     return `
       <section class="card shop">
         <h2>Confirmar pedido</h2>
@@ -810,6 +950,188 @@ function renderShop(plate) {
       </div>
       <p class="muted small">${esc(SHOP.shipping)}</p>
     </section>`;
+}
+
+// ---------- Vincular un segundo dispositivo ----------
+
+function qrSvg(text, px = 220) {
+  const { d, size } = qrPath(qrcode, text);
+  const q = 2;
+  return `<svg class="qr" xmlns="http://www.w3.org/2000/svg" viewBox="${-q} ${-q} ${size + 2 * q} ${size + 2 * q}" width="${px}" height="${px}" role="img" aria-label="Código QR"><rect x="${-q}" y="${-q}" width="${size + 2 * q}" height="${size + 2 * q}" fill="#fff"/><path d="${d}" fill="#000" shape-rendering="crispEdges"/></svg>`;
+}
+
+let pairShown = false;
+
+function renderPair(plate) {
+  const p = findPlate(plate);
+  const head = `<header class="thread-head"><button class="link" data-action="back">‹ Volver</button><div><strong>Vincular dispositivo</strong> ${p ? plateBadge(p.plate, 'small') : ''}</div></header>`;
+  if (!p) return head + '<p class="hint">Esa matrícula ya no está en este dispositivo.</p>';
+  if (!isPro()) return head + renderProCard('Vincular otro dispositivo es una función Pro.');
+  const code = encodePairing(p);
+  return `${head}
+    <section class="card">
+      <p>Comparte esta matrícula con otro móvil (por ejemplo, el de tu pareja) para que los avisos os lleguen a los dos.</p>
+      <ol class="steps">
+        <li>En el otro móvil, abre Matrícula Chat y pulsa <strong>«Vincular este dispositivo»</strong>.</li>
+        <li>Escanea este código o pega el texto.</li>
+      </ol>
+      <div class="banner warn"><strong>Solo para tus dispositivos</strong>
+        Este código da acceso completo a los avisos de la matrícula: no lo compartas con nadie más.</div>
+      ${pairShown
+        ? `<div class="center pair-qr">${qrSvg(code)}</div>
+           <div class="actions"><button class="secondary" data-action="pair-copy" data-code="${esc(code)}">Copiar código</button>
+           <button class="secondary" data-action="pair-hide">Ocultar</button></div>`
+        : '<button class="wide" data-action="pair-show">Mostrar código</button>'}
+    </section>
+    <section class="card">
+      <h2>¿Has perdido el otro dispositivo?</h2>
+      <p class="muted small">Cambia la clave de la matrícula: los dispositivos vinculados dejarán de recibir avisos y las conversaciones abiertas se cerrarán.</p>
+      <button class="secondary danger-text" data-action="rekey" data-plate="${esc(p.plate)}">Cambiar clave</button>
+    </section>`;
+}
+
+function renderLink() {
+  return `
+    <header class="thread-head"><button class="link" data-action="back">‹ Volver</button><div><strong>Vincular este dispositivo</strong></div></header>
+    <section class="card">
+      <p>En el móvil que ya tiene la matrícula, entra en <strong>Vincular dispositivo</strong> y pulsa «Mostrar código». Después escanéalo aquí o pega el texto.</p>
+      ${navigator.mediaDevices?.getUserMedia ? '<button class="wide" data-action="scan">Escanear con la cámara</button>' : ''}
+      <form data-action="link-code" class="link-form">
+        <textarea name="code" rows="3" placeholder="MCV1.…" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+        <button>Vincular</button>
+      </form>
+    </section>`;
+}
+
+async function rekeyPlate(p) {
+  const old = p.sk;
+  setBusy('Cambiando la clave…');
+  const r = await resolvePlate(p.plate);
+  p.sk = bytesToHex(generateSecretKey());
+  p.salt = randomHex(16);
+  p.proof = await proofFor(p.plate, p.salt);
+  delete p.linked;
+  save();
+  await publishClaim('claim', p, r.latest);
+  closeThreads(t => t.role === 'holder' && t.sk === old, 'rekeyed');
+  restartPlate(p.plate);
+  flash('Clave cambiada');
+}
+
+// Escáner QR con la cámara: va en una capa propia, fuera de #app, para que los
+// repintados de la interfaz no lo interrumpan.
+let scanStop = null;
+async function startScan() {
+  const layer = document.createElement('div');
+  layer.className = 'scan-layer';
+  layer.innerHTML = '<video playsinline muted></video><p>Apunta al código QR</p><button class="secondary">Cancelar</button>';
+  document.body.appendChild(layer);
+  const video = layer.querySelector('video');
+  let stream, raf, done = false;
+  const stop = () => { done = true; cancelAnimationFrame(raf); stream?.getTracks().forEach(t => t.stop()); layer.remove(); scanStop = null; };
+  scanStop = stop;
+  layer.querySelector('button').onclick = stop;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+  } catch {
+    stop();
+    throw new Error('No se ha podido abrir la cámara. Pega el código en su lugar.');
+  }
+  video.srcObject = stream;
+  await video.play();
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  await new Promise((resolve, reject) => {
+    const tick = () => {
+      if (done) return resolve();
+      if (video.readyState >= 2) {
+        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0);
+        const qr = jsQR(ctx.getImageData(0, 0, canvas.width, canvas.height).data, canvas.width, canvas.height);
+        const pairing = qr && decodePairing(qr.data);
+        if (pairing) {
+          stop();
+          linkPlate(pairing).then(() => { goHome(); flash(`Matrícula ${pairing.plate} vinculada`); resolve(); }, reject);
+          return;
+        }
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    tick();
+  });
+}
+
+// ---------- Pro ----------
+
+let products = {}; // id → { id, price, title }
+
+async function syncPurchases() {
+  if (!Billing) return;
+  try {
+    const { owned } = await Billing.restore();
+    const pro = owned.includes(PRO.productId);
+    if (store.pro !== pro) { store.pro = pro; save(); render(); }
+  } catch {} // sin conexión con Google Play: se mantiene lo que había
+}
+
+async function loadProducts() {
+  if (!Billing) return;
+  try {
+    const { products: list } = await Billing.getProducts({ ids: [PRO.productId] });
+    products = Object.fromEntries(list.map(x => [x.id, x]));
+    render();
+  } catch {}
+}
+
+async function buy(productId) {
+  if (!Billing) throw new Error('La compra está disponible en la app de Android.');
+  setBusy('Abriendo Google Play…');
+  const r = await Billing.purchase({ productId });
+  busy = '';
+  if (r.state === 'purchased') {
+    store.pro = true; save(); flash('¡Ya tienes Pro!');
+  } else if (r.state === 'pending') {
+    flash('Pago pendiente: se activará cuando Google Play lo confirme.');
+  }
+}
+
+function renderProCard(intro = '') {
+  const price = products[PRO.productId]?.price;
+  return `
+    <section class="card pro-card">
+      <h2>Matrícula Chat Pro</h2>
+      ${intro ? `<p>${esc(intro)}</p>` : ''}
+      <ul class="pro-list">
+        <li><strong>Hasta ${PRO.maxPlatesPro} matrículas</strong> en el mismo móvil: coche, moto, el de la familia…</li>
+        <li><strong>Vincular otro dispositivo</strong> para que los avisos os lleguen a los dos.</li>
+        <li><strong>Tus propias respuestas rápidas.</strong></li>
+        <li><strong>Más colores y frases</strong> para tus pegatinas.</li>
+      </ul>
+      ${isPro()
+        ? '<p class="status ok">✓ Ya tienes Pro. ¡Gracias por apoyar el proyecto!</p>'
+        : Billing
+          ? `<button class="wide" data-action="buy" data-product="${PRO.productId}">Hazte Pro${price ? ` · ${esc(price)}` : ''}</button>
+             <p class="muted small center">Pago único. <button class="link small-link" data-action="restore">Restaurar compra</button></p>`
+          : '<p class="muted small">Disponible en la app de Android.</p>'}
+    </section>`;
+}
+
+function renderPro() {
+  const head = '<header class="thread-head"><button class="link" data-action="back">‹ Volver</button><div><strong>Pro</strong></div></header>';
+  const replies = isPro() ? `
+    <section class="card">
+      <h2>Respuestas rápidas</h2>
+      <p class="muted small">Aparecen como botones en tus conversaciones cuando puedes escribir libremente.</p>
+      <ul class="reply-list">
+        ${store.replies.map((r, i) => `<li><span>${esc(r)}</span><button class="link danger" data-action="reply-del" data-index="${i}" aria-label="Borrar">Borrar</button></li>`).join('') || '<li class="muted small">Todavía no tienes ninguna.</li>'}
+      </ul>
+      ${store.replies.length < PRO.maxReplies ? `
+        <form data-action="reply-add" class="row">
+          <input name="reply" maxlength="${PRO.maxReplyLength}" placeholder="Ej.: Llego en 5 minutos" autocomplete="off">
+          <button>Añadir</button>
+        </form>` : ''}
+    </section>` : '';
+  return head + renderProCard() + replies;
 }
 
 function renderThanks() {
@@ -898,7 +1220,8 @@ function applyHash() {
   if (h.action === 'gracias') view = 'thanks';
   else if (h.action === 'avisar') view = 'quick:' + h.plate;
   else {
-    if (h.action === 'pedido') { stickerOpts.size = h.size; stickerOpts.showPlate = h.showPlate; }
+    stickerOpts.fromOrder = h.action === 'pedido';
+    if (h.action === 'pedido') Object.assign(stickerOpts, { size: h.size, showPlate: h.showPlate, theme: h.theme, headline: h.headline });
     view = 'sticker:' + h.plate;
   }
   error = '';
@@ -907,6 +1230,7 @@ function applyHash() {
 window.addEventListener('hashchange', () => { if (applyHash()) render(); });
 
 function goHome() {
+  scanStop?.();
   view = 'home'; error = '';
   if (location.hash) history.replaceState(null, '', location.pathname + location.search);
   render();
@@ -922,16 +1246,19 @@ function render() {
   const quickPlate = view.startsWith('quick:') ? view.slice(6) : null;
   const stickerPlate = view.startsWith('sticker:') ? view.slice(8) : null;
   app.innerHTML = `
-    ${t ? renderThread(t) : quickPlate ? renderQuick(quickPlate) : stickerPlate ? renderSticker(stickerPlate) : view === 'thanks' ? renderThanks() : `
+    ${t ? renderThread(t) : quickPlate ? renderQuick(quickPlate) : stickerPlate ? renderSticker(stickerPlate)
+      : view === 'thanks' ? renderThanks() : view === 'pro' ? renderPro() : view === 'link' ? renderLink()
+      : view.startsWith('pair:') ? renderPair(view.slice(5)) : `
       <header class="top">
         <h1>Matrícula Chat</h1>
         <p class="muted small">Sin servidor · cifrado de extremo a extremo · ${relays.length} ${relays.length === 1 ? 'relay público' : 'relays públicos'}</p>
       </header>
-      ${renderMyPlate()}
+      ${renderMyPlates()}
       ${renderCompose()}
       ${renderThreads()}
       <footer class="foot">
         ${notifPerm === 'prompt' ? '<button class="link" data-action="notif">Activar notificaciones</button> · ' : ''}
+        <button class="link" data-action="pro">${isPro() ? 'Pro ✓' : 'Hazte Pro'}</button> ·
         <button class="link" data-action="about">Cómo funciona</button>
       </footer>`}
     ${busy ? `<div class="toast">${esc(busy)}</div>` : ''}
@@ -953,7 +1280,25 @@ app.addEventListener('submit', e => {
   const form = e.target;
   const action = form.dataset.action;
   const data = new FormData(form, e.submitter);
-  if (action === 'claim') run(() => claimPlate(data.get('plate')));
+  if (action === 'claim') {
+    run(async () => {
+      await claimPlate(data.get('plate'));
+      app.querySelectorAll('form[data-action=claim] input').forEach(i => { i.value = ''; });
+    });
+  }
+  if (action === 'link-code') {
+    const pairing = decodePairing(data.get('code'));
+    if (!pairing) { error = 'El código no es válido. Cópialo entero desde el otro dispositivo.'; render(); return; }
+    run(async () => { await linkPlate(pairing); goHome(); flash(`Matrícula ${pairing.plate} vinculada`); });
+  }
+  if (action === 'reply-add') {
+    const v = validateReply(data.get('reply'), store.replies);
+    if (!v.ok) { error = v.error; render(); return; }
+    store.replies.push(v.text); save();
+    const live = app.querySelector('form[data-action=reply-add] input');
+    if (live) live.value = '';
+    render();
+  }
   if (action === 'compose') {
     const preset = e.submitter?.value;
     if (!preset) { error = 'Elige un aviso.'; render(); return; }
@@ -971,9 +1316,14 @@ app.addEventListener('submit', e => {
 });
 
 app.addEventListener('click', e => {
-  const el = e.target.closest('[data-action],[data-open],[data-preset],[data-quick],[data-reveal],[data-order]');
+  const el = e.target.closest('[data-action],[data-open],[data-preset],[data-quick],[data-reveal],[data-order],[data-reply]');
   if (!el) return;
   if (el.dataset.open) { view = 'thread:' + el.dataset.open; error = ''; render(); return; }
+  if (el.dataset.reply) {
+    const text = store.replies[Number(el.dataset.reply)];
+    if (text) run(() => sendInThread(view.slice(7), { type: 'text', text }));
+    return;
+  }
   if (el.dataset.order) {
     orderPack = el.dataset.order; render();
     app.querySelector('.shop')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -1001,15 +1351,30 @@ app.addEventListener('click', e => {
     }
     case 'unblock': { const t = store.threads[view.slice(7)]; if (t) { unblockThread(t); render(); } break; }
     case 'export': { const t = store.threads[view.slice(7)]; if (t) run(() => exportThread(t)); break; }
-    case 'sticker': view = 'sticker:' + store.plate.plate; error = ''; render(); window.scrollTo(0, 0); break;
+    case 'sticker': stickerOpts.fromOrder = false; view = 'sticker:' + el.dataset.plate; error = ''; render(); window.scrollTo(0, 0); break;
+    case 'pair': pairShown = false; view = 'pair:' + el.dataset.plate; error = ''; render(); window.scrollTo(0, 0); break;
+    case 'pair-show': pairShown = true; render(); break;
+    case 'pair-hide': pairShown = false; render(); break;
+    case 'pair-copy': run(async () => { await navigator.clipboard.writeText(el.dataset.code); flash('Código copiado'); }); break;
+    case 'rekey': {
+      const p = findPlate(el.dataset.plate);
+      if (p && confirm('¿Cambiar la clave? Los demás dispositivos dejarán de recibir avisos de esta matrícula.')) run(() => rekeyPlate(p));
+      break;
+    }
+    case 'link': view = 'link'; error = ''; render(); window.scrollTo(0, 0); break;
+    case 'scan': run(startScan); break;
+    case 'pro': view = 'pro'; error = ''; render(); window.scrollTo(0, 0); loadProducts(); break;
+    case 'buy': run(() => buy(el.dataset.product)); break;
+    case 'restore': run(async () => { await syncPurchases(); flash(isPro() ? 'Compra restaurada' : 'No hay compras que restaurar'); }); break;
+    case 'reply-del': store.replies.splice(Number(el.dataset.index), 1); save(); render(); break;
     case 'sticker-print': printStickers(view.slice(8)); break;
     case 'sticker-png': run(() => downloadStickerPng(view.slice(8))); break;
     case 'sticker-share': run(() => shareStickerImage(view.slice(8))); break;
     case 'sticker-link': run(() => shareStickerLink(view.slice(8))); break;
     case 'dismiss': error = ''; render(); break;
-    case 'reclaim': run(() => claimPlate(store.plate.plate)); break;
+    case 'reclaim': run(() => claimPlate(el.dataset.plate)); break;
     case 'release':
-      if (confirm('¿Liberar la matrícula? Dejarás de recibir mensajes en este dispositivo.')) run(() => releasePlate());
+      if (confirm('¿Liberar la matrícula? Dejarás de recibir sus mensajes en este dispositivo.')) run(() => releasePlate(findPlate(el.dataset.plate)));
       break;
     case 'notif': requestNotifPerm().then(render); break;
     case 'about': $('#about').showModal(); break;
@@ -1022,6 +1387,8 @@ app.addEventListener('change', e => {
   stickerOpts.size = Number(form.size.value);
   if (form.copies) stickerOpts.copies = Number(form.copies.value);
   stickerOpts.showPlate = form.showPlate.checked;
+  if (!form.theme.disabled) stickerOpts.theme = form.theme.value;
+  if (!form.headline.disabled) stickerOpts.headline = form.headline.value;
   render();
 });
 
@@ -1029,10 +1396,12 @@ app.addEventListener('change', e => {
 
 applyHash();
 render();
-upgradePlate().catch(() => {}).finally(watchMyPlate);
+upgradePlates().catch(() => {}).finally(watchPlates);
+syncPurchases();
+Billing?.addListener('purchasesUpdated', () => syncPurchases());
 checkNotifPerm().then(render);
-setInterval(() => { if (claimsReady) { recomputeMine(); render(); } markSeen(); }, 60_000);
+setInterval(() => { recomputeAll(); render(); markSeen(); }, 60_000);
 markSeen();
 
 // Para tests y depuración
-window.__mc = { store, get mine() { return mine; }, relays };
+window.__mc = { store, relays, plateStatus };

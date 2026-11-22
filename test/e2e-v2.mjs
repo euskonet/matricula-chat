@@ -46,7 +46,7 @@ const oldSk = bytesToHex(generateSecretKey());
 const v1Store = JSON.stringify({ plate: { plate: OLD, tag: 'a'.repeat(64), sk: oldSk }, threads: {}, seen: [] });
 const M = await dev('M', `if (!localStorage.getItem('mc:v1')) localStorage.setItem('mc:v1', ${JSON.stringify(v1Store)});`);
 await M.waitForSelector('.status.ok', { timeout: 20000 });
-const mStore = await M.evaluate(() => window.__mc.store.plate);
+const mStore = await M.evaluate(() => window.__mc.store.plates[0]);
 assert.equal(mStore.v, 2);
 assert.equal(mStore.sk, oldSk);
 step('una matrícula del formato anterior se migra sola, con la misma clave');

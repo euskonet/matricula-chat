@@ -37,7 +37,7 @@ public class RelayCheckerTest {
 
         RelayChecker.Result r = RelayChecker.check(new OkHttpClient(), Arrays.asList(f.getString("relay")),
                 toList(f.getJSONArray("pubkeys")), toList(f.getJSONArray("blocked")),
-                f.getString("tag"), f.getString("myPub"), f.getLong("since"), 10_000);
+                Arrays.asList(f.getString("tag")), Arrays.asList(f.getString("myPub")), f.getLong("since"), 10_000);
 
         assertEquals(1, r.relaysAnswered.get());
         assertEquals(new HashSet<>(toList(f.getJSONArray("expectedMessageIds"))), r.messages.keySet());
@@ -56,7 +56,7 @@ public class RelayCheckerTest {
     public void relayCaidoNoBloquea() {
         long t0 = System.currentTimeMillis();
         RelayChecker.Result r = RelayChecker.check(new OkHttpClient(), Arrays.asList("ws://127.0.0.1:1"),
-                Arrays.asList("a".repeat(64)), null, null, 0, 5_000);
+                Arrays.asList("a".repeat(64)), Arrays.asList(), Arrays.asList(), Arrays.asList(), 0, 5_000);
         assertEquals(0, r.relaysAnswered.get());
         assertEquals(true, System.currentTimeMillis() - t0 < 5_000);
     }

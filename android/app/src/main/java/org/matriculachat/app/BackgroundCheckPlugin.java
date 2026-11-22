@@ -25,23 +25,20 @@ public class BackgroundCheckPlugin extends Plugin {
         Set<String> pubkeys = toSet(call.getArray("pubkeys"));
         Set<String> relays = toSet(call.getArray("relays"));
         Set<String> blocked = toSet(call.getArray("blocked"));
-        String plateTag = call.getString("plateTag");
-        String myPub = call.getString("myPub");
-        String plate = call.getString("plate");
+        JSArray plates = call.getArray("plates");
+        String platesJson = plates == null ? "[]" : plates.toString();
 
-        SharedPreferences.Editor ed = CheckWorker.prefs(getContext()).edit()
+        SharedPreferences prefs = CheckWorker.prefs(getContext());
+        SharedPreferences.Editor ed = prefs.edit()
                 .putStringSet("pubkeys", pubkeys)
                 .putStringSet("relays", relays)
-                .putStringSet("blocked", blocked);
-        if (plateTag != null && myPub != null && plate != null) {
-            ed.putString("plateTag", plateTag).putString("myPub", myPub).putString("plate", plate);
-        } else {
-            ed.remove("plateTag").remove("myPub").remove("plate");
-        }
-        ed.remove("claimOk").remove("claimBad"); // otra matrícula o clave: se recalcula
+                .putStringSet("blocked", blocked)
+                .putString("plates", platesJson);
+        // Otra lista de matrículas o claves: los veredictos guardados ya no valen.
+        if (!platesJson.equals(prefs.getString("plates", ""))) ed.remove("claimOk").remove("claimBad");
         ed.apply();
 
-        if (relays.isEmpty() || (pubkeys.isEmpty() && plateTag == null)) {
+        if (relays.isEmpty() || (pubkeys.isEmpty() && (plates == null || plates.length() == 0))) {
             CheckWorker.cancel(getContext());
         } else {
             CheckWorker.schedule(getContext());
