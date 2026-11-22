@@ -24,12 +24,14 @@ public class BackgroundCheckPlugin extends Plugin {
     public void configure(PluginCall call) {
         Set<String> pubkeys = toSet(call.getArray("pubkeys"));
         Set<String> relays = toSet(call.getArray("relays"));
+        Set<String> blocked = toSet(call.getArray("blocked"));
         String plateTag = call.getString("plateTag");
         String myPub = call.getString("myPub");
 
         SharedPreferences.Editor ed = CheckWorker.prefs(getContext()).edit()
                 .putStringSet("pubkeys", pubkeys)
-                .putStringSet("relays", relays);
+                .putStringSet("relays", relays)
+                .putStringSet("blocked", blocked);
         if (plateTag != null && myPub != null) {
             ed.putString("plateTag", plateTag).putString("myPub", myPub);
         } else {

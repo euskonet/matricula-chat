@@ -17,7 +17,8 @@ const thread = generateSecretKey(), threadPub = getPublicKey(thread);
 const other = generateSecretKey();
 const tag = 'f'.repeat(56) + Math.random().toString(16).slice(2, 10).padEnd(8, '0');
 
-const msg = (to, t) => finalizeEvent({ kind: 7152, created_at: t, tags: [['p', to]], content: 'x' }, generateSecretKey());
+const msg = (to, t, sk = generateSecretKey()) => finalizeEvent({ kind: 7152, created_at: t, tags: [['p', to]], content: 'x' }, sk);
+const blockedSk = generateSecretKey();
 const claim = (sk, t, pow) => {
   const u = { kind: 7151, created_at: t, pubkey: getPublicKey(sk), tags: [['x', tag]], content: '{"action":"claim"}' };
   return finalizeEvent(pow ? minePow(u, 16) : u, sk);
@@ -29,13 +30,14 @@ const ignored = [
   msg(mePub, since - 100),                          // anterior a "since"
   claim(me, now - 10, true),                        // reclamación mía
   claim(generateSecretKey(), now - 5, false),       // sin prueba de trabajo
+  msg(mePub, now - 15, blockedSk),                  // de un remitente bloqueado
 ];
 const foreign = claim(other, now - 40, true);
 for (const ev of [...expectedMsgs, ...ignored, foreign]) await relay.publish(ev);
 relay.close();
 
 console.log(JSON.stringify({
-  relay: url, since, tag, myPub: mePub, pubkeys: [mePub, threadPub],
+  relay: url, since, tag, myPub: mePub, pubkeys: [mePub, threadPub], blocked: [getPublicKey(blockedSk)],
   expectedMessageIds: expectedMsgs.map(e => e.id), expectedForeignClaim: foreign.id,
 }));
 process.exit(0);

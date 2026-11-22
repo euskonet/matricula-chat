@@ -124,3 +124,34 @@ test('validateMessage: presets siempre, texto solo si se permite', () => {
   assert.equal(validateMessage({ v: 1, type: 'text', text: 'x'.repeat(900) }, { allowText: true }).text.length, 500);
   assert.equal(validateMessage({ v: 2, type: 'preset', preset: 'lights' }, { allowText: true }), null);
 });
+
+import { sendWait, inboundAllowed } from '../src/protocol.js';
+
+test('sendWait: 5 por minuto', () => {
+  assert.equal(sendWait([], 1000), 0);
+  assert.equal(sendWait([990, 991, 992, 993], 1000), 0);
+  assert.equal(sendWait([990, 991, 992, 993, 994], 1000), 50);   // el 1º caduca a los 1050
+  assert.equal(sendWait([900, 990, 991, 992, 993, 994], 1000), 50);
+  assert.equal(sendWait([930, 931, 932, 933, 934], 1000), 0);    // ya pasó el minuto
+});
+
+test('inboundAllowed: ritmo por remitente', () => {
+  const base = { replied: true, newThread: false };
+  assert.ok(inboundAllowed({ ...base, times: [1, 2, 3, 4], t: 5 }));
+  assert.ok(!inboundAllowed({ ...base, times: [1, 2, 3, 4, 5], t: 6 }));
+  assert.ok(inboundAllowed({ ...base, times: [1, 2, 3, 4, 5], t: 100 }));
+  // llegada desordenada: un mensaje "anterior" que cae en una ventana llena también se descarta
+  assert.ok(!inboundAllowed({ ...base, times: [100, 101, 102, 103, 104], t: 50 }));
+});
+
+test('inboundAllowed: máximo de avisos sin respuesta', () => {
+  const times = Array.from({ length: 10 }, (_, i) => i * 1000);
+  assert.ok(!inboundAllowed({ times, t: 20000, replied: false, newThread: false }));
+  assert.ok(inboundAllowed({ times, t: 20000, replied: true, newThread: false }));
+});
+
+test('inboundAllowed: conversaciones nuevas por matrícula', () => {
+  const starts = Array.from({ length: 10 }, (_, i) => 1000 + i * 10);
+  assert.ok(!inboundAllowed({ times: [], t: 1200, replied: false, newThread: true, threadStarts: starts }));
+  assert.ok(inboundAllowed({ times: [], t: 5000, replied: false, newThread: true, threadStarts: starts }));
+});

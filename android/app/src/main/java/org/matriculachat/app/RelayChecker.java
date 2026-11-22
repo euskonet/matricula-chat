@@ -48,6 +48,13 @@ public final class RelayChecker {
 
     public static Result check(OkHttpClient client, List<String> relays, Collection<String> pubkeys,
                                String plateTag, String myPub, long since, long timeoutMs) {
+        return check(client, relays, pubkeys, Collections.emptySet(), plateTag, myPub, since, timeoutMs);
+    }
+
+    /** @param blocked remitentes bloqueados: sus mensajes no cuentan ni se notifican. */
+    public static Result check(OkHttpClient client, List<String> relays, Collection<String> pubkeys,
+                               Collection<String> blocked, String plateTag, String myPub, long since, long timeoutMs) {
+        Set<String> blockedSet = new HashSet<>(blocked);
         Result result = new Result();
         Set<String> keys = new HashSet<>(pubkeys);
         boolean watchClaims = plateTag != null && !plateTag.isEmpty() && myPub != null && !myPub.isEmpty();
@@ -94,7 +101,7 @@ public final class RelayChecker {
                                 ws.close(1000, null);
                                 finish.run();
                             } else if ("EVENT".equals(type)) {
-                                handleEvent(msg.getJSONObject(2), keys, plateTag, myPub, since, now, result);
+                                handleEvent(msg.getJSONObject(2), keys, blockedSet, plateTag, myPub, since, now, result);
                             }
                         } catch (Exception ignored) {
                             // mensaje malformado de un relay: se ignora
@@ -118,7 +125,7 @@ public final class RelayChecker {
         return result;
     }
 
-    static void handleEvent(JSONObject ev, Set<String> keys, String plateTag, String myPub,
+    static void handleEvent(JSONObject ev, Set<String> keys, Set<String> blocked, String plateTag, String myPub,
                             long since, long now, Result result) {
         String id = ev.optString("id");
         long createdAt = ev.optLong("created_at");
@@ -127,6 +134,7 @@ public final class RelayChecker {
         JSONArray tags = ev.optJSONArray("tags");
 
         if (kind == KIND_MSG && hasTag(tags, "p", keys)) {
+            if (blocked.contains(ev.optString("pubkey"))) return;
             result.messages.put(id, createdAt);
         } else if (kind == KIND_CLAIM && plateTag != null && hasTag(tags, "x", Collections.singleton(plateTag))) {
             if (myPub.equals(ev.optString("pubkey"))) return;

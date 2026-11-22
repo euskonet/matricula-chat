@@ -199,3 +199,18 @@ button.wide { width: 100%; margin-top: 12px; }
   #print-sheet { display: flex !important; flex-wrap: wrap; gap: 4mm; justify-content: center; align-content: flex-start; }
   #print-sheet svg { break-inside: avoid; }
 }
+
+/* Moderación y bloqueo */
+.thread-actions { display: flex; gap: 14px; }
+button.link.danger { color: var(--danger); }
+.bubble.hidden-msg {
+  font: inherit; font-weight: 400; font-style: italic; color: var(--muted); text-align: left;
+  background: var(--bubble-peer); border: 1px dashed var(--line); cursor: pointer;
+}
+.threat {
+  margin-top: 6px; padding: 8px 10px; border-radius: 10px; font-size: 0.85rem; line-height: 1.35;
+  background: var(--danger-bg); border: 1px solid var(--danger); color: var(--text);
+}
+.threat a { color: var(--danger); font-weight: 700; }
+.threat .link { display: block; padding: 4px 0 0; font-size: 0.85rem; color: var(--danger); text-align: left; }
+.msg.peer .threat { max-width: 100%; }

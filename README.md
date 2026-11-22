@@ -19,6 +19,17 @@ La app es un conjunto de archivos estáticos (`dist/`). Los mensajes viajan por 
 | Conversaciones atadas a la clave | Si cambia el titular, las conversaciones abiertas se cierran. El nuevo dispositivo no puede leer nada anterior ni continuar conversaciones ajenas. |
 | Anti acoso | Un desconocido solo puede enviar **avisos predefinidos** hasta que el titular conteste. Lo aplica el cliente del receptor, así que modificar la app del remitente no sirve de nada. |
 
+## Moderación
+
+Como los mensajes van cifrados de extremo a extremo y no hay servidor, la moderación se hace **en el móvil** (`src/moderation.js`):
+
+- **Palabras prohibidas** (insultos y términos graves: discriminatorios, sexuales o de acoso). Un mensaje que las contenga **no se puede enviar**, y además **se censura en destino** por si el otro usa una app modificada. Los graves aparecen ocultos hasta pulsar «Ver», y aun así censurados.
+- **Contra la evasión:** tildes, mayúsculas, números por letras (`g1l1p0ll4s`), letras separadas (`p.u.t.a`), letras repetidas, palabras partidas en dos y comodines (`p*ta`). Se comparan palabras enteras para evitar falsos positivos (`disputa`, `computadora`, `reputación`).
+- **Amenazas** («te voy a matar», «sé dónde vives», «te voy a rayar el coche»…): aviso con el 112 y botón para guardar la conversación como prueba.
+- **Límite de ritmo:** máximo 5 mensajes por minuto al enviar. En destino también se descarta lo que pase de 5 por minuto por remitente, de 10 avisos sin respuesta y de 10 conversaciones nuevas cada 10 minutos.
+- **Bloquear y desbloquear** conversaciones. La tarea de Android en segundo plano tampoco avisa de los remitentes bloqueados.
+- **Guardar copia:** exporta la conversación sin censura, con fecha, claves públicas e id de cada evento.
+
 ## Pegatinas QR
 
 Desde **Mi matrícula → Crear pegatina QR** se genera una pegatina para el cristal con un QR que lleva a:

@@ -162,3 +162,35 @@ export function validateMessage(msg, { allowText }) {
   }
   return null;
 }
+
+// ---------- Límite de ritmo ----------
+// El remitente no puede enviar más de 5 mensajes por minuto (lo aplica su app),
+// y el receptor descarta lo que se pase (por si la app del otro está modificada).
+
+export const RATE = {
+  perWindow: 5,          // mensajes…
+  window: 60,            // …por minuto
+  maxUnanswered: 10,     // un desconocido sin respuesta no puede mandar más de 10 avisos
+  maxNewThreads: 10,     // conversaciones nuevas hacia mi matrícula…
+  newThreadsWindow: 600, // …cada 10 minutos (contra quien abre muchas con claves distintas)
+};
+
+/** Segundos que hay que esperar para poder enviar (0 = se puede ya). */
+export function sendWait(myTimes, now, rate = RATE) {
+  const recent = myTimes.filter(t => t > now - rate.window).sort((a, b) => a - b);
+  if (recent.length < rate.perWindow) return 0;
+  return Math.max(1, recent[recent.length - rate.perWindow] + rate.window - now);
+}
+
+/**
+ * ¿Se acepta un mensaje entrante?
+ * La ventana es simétrica alrededor de created_at: los mensajes antiguos
+ * pueden llegar desordenados al abrir la app, y así ninguna ventana de 60 s
+ * acaba con más de 5 mensajes aceptados.
+ */
+export function inboundAllowed({ times, t, replied, newThread, threadStarts = [] }, rate = RATE) {
+  if (times.filter(x => Math.abs(x - t) < rate.window).length >= rate.perWindow) return false;
+  if (!replied && times.length >= rate.maxUnanswered) return false;
+  if (newThread && threadStarts.filter(x => Math.abs(x - t) < rate.newThreadsWindow).length >= rate.maxNewThreads) return false;
+  return true;
+}

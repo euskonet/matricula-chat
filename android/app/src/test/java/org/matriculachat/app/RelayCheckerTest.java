@@ -36,8 +36,8 @@ public class RelayCheckerTest {
         JSONObject f = new JSONObject(new String(Files.readAllBytes(Paths.get(path)), "UTF-8"));
 
         RelayChecker.Result r = RelayChecker.check(new OkHttpClient(), Arrays.asList(f.getString("relay")),
-                toList(f.getJSONArray("pubkeys")), f.getString("tag"), f.getString("myPub"),
-                f.getLong("since"), 10_000);
+                toList(f.getJSONArray("pubkeys")), toList(f.getJSONArray("blocked")),
+                f.getString("tag"), f.getString("myPub"), f.getLong("since"), 10_000);
 
         assertEquals(1, r.relaysAnswered.get());
         assertEquals(new HashSet<>(toList(f.getJSONArray("expectedMessageIds"))), r.messages.keySet());

@@ -80,6 +80,7 @@ public class CheckWorker extends Worker {
         SharedPreferences p = prefs(ctx);
 
         Set<String> pubkeys = p.getStringSet("pubkeys", new HashSet<>());
+        Set<String> blocked = p.getStringSet("blocked", new HashSet<>());
         List<String> relays = new ArrayList<>(p.getStringSet("relays", new HashSet<>()));
         String plateTag = p.getString("plateTag", null);
         String myPub = p.getString("myPub", null);
@@ -92,7 +93,7 @@ public class CheckWorker extends Worker {
                 .build();
         RelayChecker.Result r;
         try {
-            r = RelayChecker.check(client, relays, pubkeys, plateTag, myPub, seenAt + 1, 25_000);
+            r = RelayChecker.check(client, relays, pubkeys, blocked, plateTag, myPub, seenAt + 1, 25_000);
         } finally {
             client.dispatcher().executorService().shutdown();
             client.connectionPool().evictAll();

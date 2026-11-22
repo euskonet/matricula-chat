@@ -6,7 +6,9 @@ import {
 import {
   KIND_CLAIM, KIND_MSG, PARAMS, PLATE_KDF, PRESETS, presetText,
   normalizePlate, isValidPlate, isModernSpanishPlate, resolveClaims, validateMessage,
+  sendWait, inboundAllowed,
 } from './protocol.js';
+import { analyze, checkOutgoing } from './moderation.js';
 import { WEB_URL, quickLink, parseHash, stickerSvg } from './sticker.js';
 
 // ---------- Configuración ----------
@@ -42,9 +44,9 @@ const now = () => Math.floor(Date.now() / 1000);
 function load() {
   try {
     const s = JSON.parse(localStorage.getItem(STORE_KEY));
-    if (s && typeof s === 'object') return { plate: null, threads: {}, seen: [], ...s };
+    if (s && typeof s === 'object') return { plate: null, threads: {}, seen: [], blocked: [], ...s };
   } catch {}
-  return { plate: null, threads: {}, seen: [] };
+  return { plate: null, threads: {}, seen: [], blocked: [] };
 }
 const store = load();
 const seen = new Set(store.seen);
@@ -85,25 +87,50 @@ async function fetchClaims(tag) {
 
 async function resolvePlate(plate) {
   const tag = await plateTag(plate);
-  return { tag, ...resolveClaims(await fetchClaims(tag), tag, now()) };
+  const events = await fetchClaims(tag);
+  for (const ev of events) claimEvents.set(ev.id, ev); // resolveClaims filtra por matrícula
+  return { tag, ...resolveClaims(events, tag, now()) };
+}
+
+// Fecha más reciente de las reclamaciones conocidas de una matrícula (sin contar
+// las fechadas demasiado en el futuro, que el protocolo ignora).
+function latestClaimAt(tag) {
+  let max = 0;
+  for (const ev of claimEvents.values()) {
+    if (ev.tags.some(t => t[0] === 'x' && t[1] === tag) && ev.created_at <= now() + PARAMS.maxFutureSkew) {
+      max = Math.max(max, ev.created_at);
+    }
+  }
+  return max;
 }
 
 const tick = () => new Promise(r => setTimeout(r, 30));
 
 async function publishClaim(action, tag, skHex) {
+  // Siempre posterior a la última reclamación conocida: si dos reclamaciones
+  // cayeran en el mismo segundo, el desempate podría ordenarlas al revés.
   const unsigned = {
-    kind: KIND_CLAIM, created_at: now(), pubkey: pubOf(skHex),
+    kind: KIND_CLAIM, created_at: Math.max(now(), latestClaimAt(tag) + 1), pubkey: pubOf(skHex),
     tags: [['x', tag]], content: JSON.stringify({ action }),
   };
   await tick(); // deja que se pinte el "trabajando…"
-  const mined = minePow(unsigned, PARAMS.claimPow);
+  // keepCreatedAt: si no, minePow sustituye la fecha por "ahora" y se pierde el ajuste de arriba.
+  const mined = minePow(unsigned, PARAMS.claimPow, { keepCreatedAt: true });
   const ev = finalizeEvent(mined, hexToBytes(skHex));
   await publish(ev);
   claimEvents.set(ev.id, ev);
   return ev;
 }
 
+// Máximo 5 mensajes por minuto desde este dispositivo, sumando todas las conversaciones.
+function assertCanSend() {
+  const mine = Object.values(store.threads).flatMap(t => t.messages.filter(m => m.from === 'me').map(m => m.at));
+  const wait = sendWait(mine, now());
+  if (wait) throw new Error(`Has enviado 5 mensajes en el último minuto. Espera ${wait} s.`);
+}
+
 async function sendRaw(thread, payload) {
+  assertCanSend();
   const ev = finalizeEvent({
     kind: KIND_MSG, created_at: now(),
     tags: [['p', thread.peer], ['expiration', String(now() + PARAMS.msgTtl)]],
@@ -230,6 +257,9 @@ function watchInbox() {
 function handleMsg(ev) {
   if (seen.has(ev.id)) return;
   const p = ev.tags.find(t => t[0] === 'p')?.[1];
+  if (ev.created_at > now() + PARAMS.maxFutureSkew) return;
+  if (store.blocked.includes(ev.pubkey)) { seen.add(ev.id); save(); return; }
+  const peerTimes = t => (t ? t.messages.filter(m => m.from === 'peer').map(m => m.at) : []);
 
   // 1) Mensaje para mi matrícula
   if (store.plate && p === pubOf(store.plate.sk)) {
@@ -239,6 +269,10 @@ function handleMsg(ev) {
     const id = 'in:' + ev.pubkey;
     let t = store.threads[id];
     if (t?.closed) { save(); return; }
+    const starts = Object.values(store.threads).filter(x => x.role === 'holder').map(x => x.created);
+    if (!inboundAllowed({ times: peerTimes(t), t: ev.created_at, replied: !!t?.meReplied, newThread: !t, threadStarts: starts })) {
+      save(); return; // demasiados mensajes: se descarta
+    }
     const msg = validateMessage(decryptFrom(store.plate.sk, ev.pubkey, ev.content), {
       allowText: !!t?.meReplied,
     });
@@ -254,7 +288,7 @@ function handleMsg(ev) {
     t.updated = Math.max(t.updated || 0, ev.created_at);
     t.unread = (t.unread || 0) + 1;
     save();
-    notify(`Mensaje para ${t.plate}`, msg.type === 'preset' ? presetText(msg.preset) : msg.text);
+    notify(`Mensaje para ${t.plate}`, notifText(msg));
     render();
     return;
   }
@@ -263,6 +297,7 @@ function handleMsg(ev) {
   const t = Object.values(store.threads).find(x => x.role === 'sender' && x.myPub === p);
   seen.add(ev.id);
   if (!t || t.closed || ev.pubkey !== t.peer) { save(); return; }
+  if (!inboundAllowed({ times: peerTimes(t), t: ev.created_at, replied: true, newThread: false })) { save(); return; }
   const msg = validateMessage(decryptFrom(t.sk, ev.pubkey, ev.content), { allowText: true });
   if (!msg) { save(); return; }
   t.messages.push({ id: ev.id, from: 'peer', ...msg, at: ev.created_at });
@@ -271,13 +306,14 @@ function handleMsg(ev) {
   t.updated = Math.max(t.updated || 0, ev.created_at);
   t.unread = (t.unread || 0) + 1;
   save();
-  notify(`Respuesta de ${t.plate}`, msg.type === 'preset' ? presetText(msg.preset) : msg.text);
+  notify(`Respuesta de ${t.plate}`, notifText(msg));
   render();
 }
 
 async function startConversation(input, presetId) {
   const plate = normalizePlate(input);
   if (!isValidPlate(plate)) throw new Error('Matrícula no válida.');
+  assertCanSend();
   setBusy('Buscando matrícula…');
   const r = await resolvePlate(plate);
   if (r.status === 'disputed') throw new Error('Esa matrícula está en disputa y no recibe mensajes ahora mismo.');
@@ -307,6 +343,11 @@ async function sendInThread(id, payload) {
   if (payload.type === 'text' && t.role === 'sender' && !t.peerReplied) {
     throw new Error('Podrás escribir texto libre cuando el titular conteste.');
   }
+  if (payload.type === 'text') {
+    const check = checkOutgoing(payload.text);
+    if (!check.ok) throw new Error(`No se puede enviar: contiene lenguaje no permitido («${check.masked}»).`);
+  }
+  assertCanSend();
   setBusy('Enviando…');
   if (t.role === 'sender') {
     // Antes de cada envío se comprueba que el titular sigue siendo el mismo
@@ -379,6 +420,7 @@ function syncBackground() {
   const cfg = {
     pubkeys: [...new Set(pubkeys)].sort(),
     relays,
+    blocked: [...store.blocked].sort(),
     plateTag: active ? store.plate.tag : null,
     myPub: active ? pubOf(store.plate.sk) : null,
   };
@@ -411,7 +453,38 @@ const fmtTime = t => {
     : fmtDate(t);
 };
 const plateBadge = (p, cls = '') => `<span class="plate ${cls}"><span class="eu">E</span><span class="num">${fmtPlate(p)}</span></span>`;
-const msgText = m => m.type === 'preset' ? esc(presetText(m.preset)) : esc(m.text);
+// Los mensajes se guardan tal cual y se censuran al mostrarlos: así las
+// mejoras de la lista se aplican también a lo ya recibido.
+const modCache = new Map();
+function moderated(text) {
+  if (!modCache.has(text)) modCache.set(text, analyze(text));
+  return modCache.get(text);
+}
+const msgText = m => m.type === 'preset' ? esc(presetText(m.preset)) : esc(moderated(m.text).masked);
+function previewText(m) {
+  if (m.type === 'text' && m.from === 'peer' && moderated(m.text).level === 'severe') return 'Mensaje ocultado';
+  return msgText(m);
+}
+function notifText(msg) {
+  if (msg.type === 'preset') return presetText(msg.preset);
+  const a = moderated(msg.text);
+  return a.level === 'severe' ? 'Mensaje ocultado por lenguaje ofensivo' : a.masked;
+}
+const revealed = new Set();
+
+function msgHtml(m) {
+  const peer = m.from === 'peer' && m.type === 'text';
+  const a = peer ? moderated(m.text) : null;
+  const hidden = peer && a.level === 'severe' && !revealed.has(m.id);
+  const bubble = hidden
+    ? `<button class="bubble hidden-msg" data-reveal="${esc(m.id)}">Mensaje ocultado por lenguaje ofensivo · <u>Ver</u></button>`
+    : `<div class="bubble ${m.type}">${msgText(m)}</div>`;
+  const threat = peer && a.threat
+    ? `<div class="threat">⚠ Este mensaje puede ser una amenaza. Si estás en peligro, llama al <a href="tel:112">112</a>.
+         <button class="link" data-action="export">Guardar la conversación como prueba</button></div>`
+    : '';
+  return `<div class="msg ${m.from}">${bubble}<time>${fmtTime(m.at)}</time>${threat}</div>`;
+}
 const shortId = pub => '#' + pub.slice(0, 4);
 
 function closedReason(r) {
@@ -420,6 +493,7 @@ function closedReason(r) {
     disputed: 'La matrícula está en disputa. Esta conversación se ha cerrado.',
     kicked: 'Otro dispositivo ha reclamado tu matrícula. Esta conversación se ha cerrado.',
     released: 'Liberaste la matrícula. Esta conversación se ha cerrado.',
+    blocked: 'Has bloqueado esta conversación. No recibirás más mensajes de esta persona.',
   }[r] || 'Conversación cerrada.';
 }
 
@@ -493,7 +567,7 @@ function renderThreads() {
             : `Conductor ${shortId(t.peer)} → ${plateBadge(t.plate, 'small')}`;
           return `<li><button class="thread" data-open="${esc(t.id)}">
             <span class="who">${who}${t.unread ? `<span class="dot">${t.unread}</span>` : ''}</span>
-            <span class="last ${t.closed ? 'muted' : ''}">${t.closed ? 'Cerrada · ' : ''}${last ? (last.from === 'me' ? 'Tú: ' : '') + msgText(last) : ''}</span>
+            <span class="last ${t.closed ? 'muted' : ''}">${t.closed ? 'Cerrada · ' : ''}${last ? (last.from === 'me' ? 'Tú: ' : '') + previewText(last) : ''}</span>
             <span class="time">${last ? fmtTime(last.at) : ''}</span>
           </button></li>`;
         }).join('')}
@@ -511,12 +585,20 @@ function renderThread(t) {
     : `Conductor ${shortId(t.peer)} <span class="muted small">a tu matrícula</span>`;
   return `
     <header class="thread-head">
-      <button class="link" data-action="back">‹ Volver</button>
+      <div class="between">
+        <button class="link" data-action="back">‹ Volver</button>
+        <div class="thread-actions">
+          <button class="link" data-action="export">Guardar copia</button>
+          ${t.closed === 'blocked'
+            ? '<button class="link" data-action="unblock">Desbloquear</button>'
+            : t.closed ? '' : '<button class="link danger" data-action="block">Bloquear</button>'}
+        </div>
+      </div>
       <div>${title}</div>
     </header>
     <section class="messages">
       ${t.role === 'holder' && !t.meReplied ? `<p class="hint">Este conductor solo puede enviarte avisos predefinidos hasta que le contestes.</p>` : ''}
-      ${t.messages.map(m => `<div class="msg ${m.from}"><div class="bubble ${m.type}">${msgText(m)}</div><time>${fmtTime(m.at)}</time></div>`).join('')}
+      ${t.messages.map(msgHtml).join('')}
       ${t.closed ? `<p class="hint danger">${esc(closedReason(t.closed))}</p>` : ''}
     </section>
     ${t.closed ? '' : `
@@ -527,6 +609,59 @@ function renderThread(t) {
         <button ${canText ? '' : 'disabled'}>Enviar</button>
       </form>
     </footer>`}`;
+}
+
+// ---------- Bloquear ----------
+
+function blockThread(t) {
+  if (!store.blocked.includes(t.peer)) store.blocked.push(t.peer);
+  t.closed = 'blocked';
+  save();
+}
+
+function unblockThread(t) {
+  store.blocked = store.blocked.filter(k => k !== t.peer);
+  if (t.closed === 'blocked') t.closed = null;
+  save();
+}
+
+// ---------- Guardar la conversación como prueba ----------
+
+function exportText(t) {
+  const iso = s => new Date(s * 1000).toISOString();
+  const who = m => (m.from === 'me' ? 'Yo' : t.role === 'holder' ? `Conductor ${shortId(t.peer)}` : `Titular de ${t.plate}`);
+  const body = t.messages.map(m =>
+    `[${iso(m.at)}] ${who(m)}: ${m.type === 'preset' ? `[aviso] ${presetText(m.preset)}` : m.text}\n    id del evento: ${m.id}`);
+  return [
+    'Matrícula Chat · copia de una conversación',
+    `Generada: ${new Date().toISOString()}`,
+    `Matrícula: ${t.plate}`,
+    `Papel: ${t.role === 'holder' ? 'titular de la matrícula (receptor)' : 'remitente'}`,
+    `Mi clave pública: ${t.myPub}`,
+    `Clave pública del otro: ${t.peer}`,
+    '',
+    'Los mensajes se muestran sin censura. Cada mensaje es un evento firmado en la red Nostr;',
+    'su id permite comprobar que existió en los relays mientras no haya caducado (72 h).',
+    '',
+    ...body,
+    '',
+  ].join('\n');
+}
+
+async function exportThread(t) {
+  const name = `conversacion-${t.plate}-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.txt`;
+  const text = exportText(t);
+  if (isNative) {
+    const file = await Filesystem.writeFile({ path: name, data: text, directory: Directory.Cache, encoding: 'utf8' });
+    try { await Share.share({ title: 'Conversación de Matrícula Chat', files: [file.uri] }); } catch (e) { if (!isCancel(e)) throw e; }
+    return;
+  }
+  const a = Object.assign(document.createElement('a'), {
+    href: URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' })), download: name,
+  });
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+  flash('Copia guardada');
 }
 
 // ---------- Aviso rápido (al escanear una pegatina) ----------
@@ -719,9 +854,10 @@ app.addEventListener('submit', e => {
 });
 
 app.addEventListener('click', e => {
-  const el = e.target.closest('[data-action],[data-open],[data-preset],[data-quick]');
+  const el = e.target.closest('[data-action],[data-open],[data-preset],[data-quick],[data-reveal]');
   if (!el) return;
   if (el.dataset.open) { view = 'thread:' + el.dataset.open; error = ''; render(); return; }
+  if (el.dataset.reveal) { revealed.add(el.dataset.reveal); render(); return; }
   if (el.dataset.quick) {
     const plate = view.slice(6), preset = el.dataset.quick;
     run(async () => {
@@ -734,6 +870,13 @@ app.addEventListener('click', e => {
   if (el.dataset.preset) { run(() => sendInThread(view.slice(7), { type: 'preset', preset: el.dataset.preset })); return; }
   switch (el.dataset.action) {
     case 'back': goHome(); break;
+    case 'block': {
+      const t = store.threads[view.slice(7)];
+      if (t && confirm('¿Bloquear esta conversación? No recibirás más mensajes de esta persona.')) { blockThread(t); render(); }
+      break;
+    }
+    case 'unblock': { const t = store.threads[view.slice(7)]; if (t) { unblockThread(t); render(); } break; }
+    case 'export': { const t = store.threads[view.slice(7)]; if (t) run(() => exportThread(t)); break; }
     case 'sticker': view = 'sticker:' + store.plate.plate; error = ''; render(); window.scrollTo(0, 0); break;
     case 'sticker-print': printStickers(view.slice(8)); break;
     case 'sticker-png': run(() => downloadStickerPng(view.slice(8))); break;
