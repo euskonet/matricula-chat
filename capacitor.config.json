@@ -1,0 +1,9 @@
+{
+  "appId": "org.matriculachat.app",
+  "appName": "Matrícula Chat",
+  "webDir": "dist",
+  "android": { "allowMixedContent": false },
+  "plugins": {
+    "LocalNotifications": { "iconColor": "#0b3d91" }
+  }
+}

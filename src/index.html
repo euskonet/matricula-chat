@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Matrícula Chat</title>
+  <meta name="description" content="Avisa a otros conductores por su matrícula. Sin servidor, sin registro, cifrado de extremo a extremo.">
+  <meta name="theme-color" content="#0b3d91">
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main id="app"><p class="muted center">Cargando…</p></main>
+
+  <dialog id="about">
+    <h2>Cómo funciona</h2>
+    <p><strong>No hay servidor.</strong> La app es un archivo estático. Los mensajes viajan por <em>relays</em> públicos de la red Nostr, que mantienen terceros. Nosotros no tenemos ninguna máquina.</p>
+    <p><strong>No hay cuentas.</strong> Tu dispositivo genera una clave al registrar la matrícula. No pedimos nombre, teléfono ni email.</p>
+    <p><strong>Cifrado de extremo a extremo.</strong> Los relays solo ven datos cifrados. La matrícula se publica como un hash scrypt, nunca en claro.</p>
+    <p><strong>Una matrícula, un dispositivo.</strong> Si otro dispositivo registra tu matrícula, el tuyo deja de recibir mensajes y se te avisa. El nuevo dispositivo no puede leer nada anterior. Si una matrícula cambia de manos 3 veces en 24&nbsp;h, queda congelada 24&nbsp;h y nadie recibe mensajes.</p>
+    <p><strong>Solo avisos al principio.</strong> Un desconocido solo puede enviarte avisos predefinidos hasta que le contestes.</p>
+    <p><strong>Los mensajes caducan</strong> a las 72&nbsp;h en los relays que respetan la expiración.</p>
+    <p class="muted small">Prototipo. Las notificaciones solo llegan con la app abierta.</p>
+    <form method="dialog"><button>Entendido</button></form>
+  </dialog>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

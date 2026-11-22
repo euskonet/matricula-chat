@@ -1,0 +1,25 @@
+{
+  "name": "matricula-chat",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "build": "node build.mjs",
+    "relay": "node test/relay.mjs"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/core": "^8.6.2",
+    "@capacitor/ios": "^8.6.2",
+    "@capacitor/local-notifications": "^8.3.1",
+    "@noble/hashes": "^2.4.0",
+    "nostr-tools": "^2.26.1"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.6.2",
+    "esbuild": "^0.28.2",
+    "ws": "^8.23.0"
+  },
+  "type": "module"
+}
