@@ -11,9 +11,14 @@ export function quickLink(base, plate) {
   return `${base.split('#')[0]}#avisar=${encodeURIComponent(plate)}`;
 }
 
-/** Lee el fragmento de la URL: { action: 'avisar' | 'pegatina', plate } o null. */
+/** Lee el fragmento de la URL: { action: 'avisar' | 'pegatina' | 'pedido' | 'gracias', ... } o null. */
 export function parseHash(hash) {
   const params = new URLSearchParams(String(hash || '').replace(/^#/, ''));
+  if (params.has('gracias')) return { action: 'gracias' };
+  if (params.has('pedido')) {
+    const m = /^([A-Z0-9]{4,10})-(50|70|90)-([01])$/.exec(String(params.get('pedido')).toUpperCase());
+    return m ? { action: 'pedido', plate: m[1], size: Number(m[2]), showPlate: m[3] === '1' } : null;
+  }
   for (const action of ['avisar', 'pegatina']) {
     const raw = params.get(action);
     if (raw != null) {

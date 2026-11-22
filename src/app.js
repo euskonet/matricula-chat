@@ -10,6 +10,7 @@ import {
 } from './protocol.js';
 import { analyze, checkOutgoing } from './moderation.js';
 import { WEB_URL, quickLink, parseHash, stickerSvg } from './sticker.js';
+import { SHOP, activePacks, orderRef, checkoutUrl } from './shop.js';
 
 // ---------- Configuración ----------
 
@@ -771,6 +772,53 @@ function renderSticker(plate) {
         <button class="secondary" data-action="sticker-link">Compartir enlace</button>
       </div>
       <p class="muted small">Pégala en el cristal mirando hacia fuera. Quien la escanee podrá avisarte desde el navegador, sin instalar nada. El enlace solo contiene tu matrícula, que de todas formas se ve en el coche.</p>
+    </section>
+    ${renderShop(plate)}`;
+}
+
+// ---------- Encargar pegatinas ----------
+
+let orderPack = null;
+
+function renderShop(plate) {
+  const packs = activePacks();
+  if (!packs.length) return '';
+  const pack = packs.find(p => p.id === orderPack);
+  if (pack) {
+    const href = checkoutUrl(pack, orderRef(plate, stickerOpts.size, stickerOpts.showPlate));
+    return `
+      <section class="card shop">
+        <h2>Confirmar pedido</h2>
+        <dl class="summary">
+          <dt>Pegatinas</dt><dd>${pack.units} de vinilo, ${stickerOpts.size / 10} cm</dd>
+          <dt>Matrícula impresa</dt><dd>${stickerOpts.showPlate ? 'Sí' : 'No'}</dd>
+          <dt>Precio</dt><dd>${esc(pack.price)} · ${esc(SHOP.shipping)}</dd>
+        </dl>
+        <p class="muted small">El pago y la dirección de envío se gestionan en Stripe. Solo usamos esos datos para enviarte el pedido.</p>
+        <div class="actions">
+          <a class="btn" href="${esc(href)}" target="_blank" rel="noopener" data-action="order-go">Ir a pagar</a>
+          <button class="secondary" data-action="order-cancel">Cancelar</button>
+        </div>
+      </section>`;
+  }
+  return `
+    <section class="card shop">
+      <h2>Pegatinas de vinilo</h2>
+      <p class="muted small">Resistentes al sol y a la lluvia, con este mismo diseño. Te las enviamos a casa.</p>
+      <div class="packs">
+        ${packs.map(p => `<button class="pack" data-order="${esc(p.id)}"><strong>${p.units} pegatinas</strong><span>${esc(p.price)}</span></button>`).join('')}
+      </div>
+      <p class="muted small">${esc(SHOP.shipping)}</p>
+    </section>`;
+}
+
+function renderThanks() {
+  return `
+    <header class="thread-head"><button class="link" data-action="back">‹ Inicio</button></header>
+    <section class="card thanks">
+      <h2>¡Gracias por tu pedido!</h2>
+      <p>Recibirás un email de confirmación del pago. Preparamos tus pegatinas y te las enviamos en unos días.</p>
+      <p class="muted small">Si tienes cualquier duda, escríbenos a la dirección que aparece en ese email.</p>
     </section>`;
 }
 
@@ -846,7 +894,13 @@ function flash(msg) {
 function applyHash() {
   const h = parseHash(location.hash);
   if (!h) return false;
-  view = (h.action === 'avisar' ? 'quick:' : 'sticker:') + h.plate;
+  orderPack = null;
+  if (h.action === 'gracias') view = 'thanks';
+  else if (h.action === 'avisar') view = 'quick:' + h.plate;
+  else {
+    if (h.action === 'pedido') { stickerOpts.size = h.size; stickerOpts.showPlate = h.showPlate; }
+    view = 'sticker:' + h.plate;
+  }
   error = '';
   return true;
 }
@@ -868,7 +922,7 @@ function render() {
   const quickPlate = view.startsWith('quick:') ? view.slice(6) : null;
   const stickerPlate = view.startsWith('sticker:') ? view.slice(8) : null;
   app.innerHTML = `
-    ${t ? renderThread(t) : quickPlate ? renderQuick(quickPlate) : stickerPlate ? renderSticker(stickerPlate) : `
+    ${t ? renderThread(t) : quickPlate ? renderQuick(quickPlate) : stickerPlate ? renderSticker(stickerPlate) : view === 'thanks' ? renderThanks() : `
       <header class="top">
         <h1>Matrícula Chat</h1>
         <p class="muted small">Sin servidor · cifrado de extremo a extremo · ${relays.length} ${relays.length === 1 ? 'relay público' : 'relays públicos'}</p>
@@ -917,9 +971,14 @@ app.addEventListener('submit', e => {
 });
 
 app.addEventListener('click', e => {
-  const el = e.target.closest('[data-action],[data-open],[data-preset],[data-quick],[data-reveal]');
+  const el = e.target.closest('[data-action],[data-open],[data-preset],[data-quick],[data-reveal],[data-order]');
   if (!el) return;
   if (el.dataset.open) { view = 'thread:' + el.dataset.open; error = ''; render(); return; }
+  if (el.dataset.order) {
+    orderPack = el.dataset.order; render();
+    app.querySelector('.shop')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    return;
+  }
   if (el.dataset.reveal) { revealed.add(el.dataset.reveal); render(); return; }
   if (el.dataset.quick) {
     const plate = view.slice(6), preset = el.dataset.quick;
@@ -932,7 +991,9 @@ app.addEventListener('click', e => {
   }
   if (el.dataset.preset) { run(() => sendInThread(view.slice(7), { type: 'preset', preset: el.dataset.preset })); return; }
   switch (el.dataset.action) {
-    case 'back': goHome(); break;
+    case 'back': orderPack = null; goHome(); break;
+    case 'order-cancel': orderPack = null; render(); break;
+    case 'order-go': setTimeout(() => { orderPack = null; render(); }, 800); break; // el enlace se abre solo
     case 'block': {
       const t = store.threads[view.slice(7)];
       if (t && confirm('¿Bloquear esta conversación? No recibirás más mensajes de esta persona.')) { blockThread(t); render(); }

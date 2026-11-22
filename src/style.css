@@ -167,6 +167,7 @@ a.btn {
   font-weight: 600; border-radius: 10px; padding: 11px 16px;
 }
 button.wide { width: 100%; margin-top: 12px; }
+a.btn:not(.secondary) { background: var(--accent); color: var(--accent-ink); }
 
 /* Aviso rápido (al escanear la pegatina) */
 .quick { margin-top: 16px; }
@@ -214,3 +215,17 @@ button.link.danger { color: var(--danger); }
 .threat a { color: var(--danger); font-weight: 700; }
 .threat .link { display: block; padding: 4px 0 0; font-size: 0.85rem; color: var(--danger); text-align: left; }
 .msg.peer .threat { max-width: 100%; }
+
+/* Tienda de pegatinas */
+.packs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 10px 0 8px; }
+.pack {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left;
+  background: var(--accent-soft); color: var(--text); border: 1px solid transparent; padding: 12px;
+}
+.pack strong { font-size: 0.98rem; }
+.pack span { color: var(--accent); font-weight: 700; font-size: 1.1rem; }
+.pack:hover { border-color: var(--accent); }
+.summary { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 4px 0 12px; font-size: 0.93rem; }
+.summary dt { color: var(--muted); }
+.summary dd { margin: 0; font-weight: 600; }
+.thanks { margin-top: 16px; text-align: center; }
