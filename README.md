@@ -41,6 +41,20 @@ npx cap open ios        # abre Xcode: elige tu equipo de firma y pulsa ▶
 
 Para instalarla en un iPhone hace falta una cuenta de Apple (gratuita para probar en tu propio dispositivo; 99 €/año para TestFlight o la App Store).
 
+**Comprobación en segundo plano (Android)**
+
+- `android/.../RelayChecker.java`: consulta los relays (Java puro + OkHttp).
+- `android/.../CheckWorker.java`: tarea periódica y notificaciones.
+- `android/.../BackgroundCheckPlugin.java`: puente con la app web (`configure`, `markSeen`, `checkNow`).
+
+Test de integración contra el relay local:
+
+```bash
+npm run relay &
+node test/bg-fixture.mjs > /tmp/fixture.json
+cd android && BG_FIXTURE=/tmp/fixture.json ./gradlew testDebugUnitTest
+```
+
 ## Desarrollo
 
 ```bash
@@ -62,7 +76,7 @@ Sin el parámetro `?relays=`, la app usa los relays públicos definidos en `DEFA
 
 ## Limitaciones conocidas (es un prototipo)
 
-- **Las notificaciones solo llegan con la app abierta o recién minimizada.** Al poco de pasar a segundo plano, Android e iOS congelan la app. El push con la app cerrada exige pasar por Apple o Google, y en la práctica necesita un servidor que envíe el push. Es la principal concesión del modelo "sin servidor".
+- **Notificaciones con la app cerrada:** en **Android**, una tarea periódica (WorkManager) consulta los relays cada ~15 minutos y avisa de mensajes nuevos o de que otro dispositivo ha reclamado tu matrícula. Solo conoce claves públicas, así que el aviso dice cuántos mensajes hay, no qué dicen. Android puede retrasarla en modo ahorro de batería, y algunos fabricantes (Xiaomi, Huawei, Samsung…) la cortan si no se excluye la app de la optimización de batería. En **iOS y web** solo hay notificaciones con la app abierta. El push con la app cerrada exige pasar por Apple o Google, y en la práctica necesita un servidor que envíe el push. Es la principal concesión del modelo "sin servidor".
 - **Metadatos públicos.** Cualquiera puede ver en los relays que el hash H tiene titular y que la clave K recibe mensajes a ciertas horas, aunque no pueda leer el contenido. Mejora posible: *gift wrap* (NIP-59).
 - **Enumeración de matrículas.** scrypt encarece mucho recorrer los ~80 M de matrículas posibles, pero no lo impide. Alguien con mucha capacidad de cálculo podría saber qué matrículas están registradas.
 - **No hay reloj de confianza.** Las fechas de los eventos las pone quien los firma. Se rechazan las fechas futuras, pero un atacante podría antedatar reclamaciones para provocar una disputa (congelar una matrícula), no para quedársela.

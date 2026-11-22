@@ -1,6 +1,6 @@
 import {
   SimplePool, finalizeEvent, generateSecretKey, getPublicKey, nip44, minePow,
-  scryptAsync, bytesToHex, hexToBytes, Capacitor, LocalNotifications,
+  scryptAsync, bytesToHex, hexToBytes, Capacitor, LocalNotifications, registerPlugin,
 } from './vendor.js';
 import {
   KIND_CLAIM, KIND_MSG, PARAMS, PLATE_KDF, PRESETS, presetText,
@@ -31,6 +31,8 @@ const relays = getRelays();
 // En móvil el sistema corta los WebSockets al pasar a segundo plano: reconectar.
 const pool = new SimplePool({ enablePing: true, enableReconnect: true });
 const isNative = Capacitor.isNativePlatform();
+// Plugin nativo propio (android/.../BackgroundCheckPlugin.java). Solo existe en la app.
+const BackgroundCheck = isNative && Capacitor.getPlatform() === 'android' ? registerPlugin('BackgroundCheck') : null;
 const now = () => Math.floor(Date.now() / 1000);
 
 // ---------- Almacenamiento local (solo en este dispositivo) ----------
@@ -356,7 +358,38 @@ function notify(title, body) {
     }
   } catch {}
 }
-document.addEventListener('visibilitychange', () => { if (!document.hidden) document.title = 'Matrícula Chat'; });
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) document.title = 'Matrícula Chat';
+  markSeen();
+});
+
+// ---------- Comprobación en segundo plano (Android) ----------
+// La tarea nativa solo recibe claves PÚBLICAS: puede contar mensajes nuevos
+// y detectar reclamaciones de mi matrícula, pero no leer nada.
+
+let bgSig = '';
+function syncBackground() {
+  if (!BackgroundCheck || (store.plate && !claimsReady)) return;
+  const active = !!store.plate && mine.status === 'active';
+  const pubkeys = Object.values(store.threads)
+    .filter(t => t.role === 'sender' && !t.closed).map(t => t.myPub);
+  if (active) pubkeys.push(pubOf(store.plate.sk));
+  const cfg = {
+    pubkeys: [...new Set(pubkeys)].sort(),
+    relays,
+    plateTag: active ? store.plate.tag : null,
+    myPub: active ? pubOf(store.plate.sk) : null,
+  };
+  const sig = JSON.stringify(cfg);
+  if (sig === bgSig) return;
+  bgSig = sig;
+  BackgroundCheck.configure(cfg).catch(() => { bgSig = ''; });
+}
+
+// La app está a la vista y ya ha mostrado lo recibido: que la tarea no lo repita.
+function markSeen() {
+  if (BackgroundCheck && !document.hidden) BackgroundCheck.markSeen({ at: now() }).catch(() => {});
+}
 
 // ---------- Interfaz ----------
 
@@ -523,6 +556,7 @@ function render() {
   });
   if (t) app.querySelector('.messages')?.scrollTo(0, 1e9);
   watchInbox();
+  syncBackground();
 }
 
 app.addEventListener('submit', e => {
@@ -569,7 +603,8 @@ app.addEventListener('click', e => {
 watchMyPlate();
 render();
 checkNotifPerm().then(render);
-setInterval(() => { if (claimsReady) { recomputeMine(); render(); } }, 60_000);
+setInterval(() => { if (claimsReady) { recomputeMine(); render(); } markSeen(); }, 60_000);
+markSeen();
 
 // Para tests y depuración
 window.__mc = { store, get mine() { return mine; }, relays };

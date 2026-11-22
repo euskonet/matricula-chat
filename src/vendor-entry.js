@@ -6,3 +6,4 @@ export { scryptAsync } from '@noble/hashes/scrypt.js';
 export { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 export { Capacitor } from '@capacitor/core';
 export { LocalNotifications } from '@capacitor/local-notifications';
+export { registerPlugin } from '@capacitor/core';
